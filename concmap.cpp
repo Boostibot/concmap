@@ -724,12 +724,185 @@ struct Bag {
                 instance_gen += 1;
             }
             
-            instance->
-
             uint32_t new_instance_gen = instance_generation.load();
             if(instance_gen == new_instance_gen)
                 break;
         }
+    }
+};
+
+template <typename T, size_t N>
+struct Small_Array {
+    T* data;
+    uint32_t size;
+    uint32_t capacity;
+    alignas(T) uint8_t small[N*sizeof(T)];
+
+    Small_Array(size_t cap = 0) {
+        if(cap <= N)
+            data = (T*) (void*) small;
+        else 
+            data = malloc(cap*sizeof(T));
+        capacity = (uint32_t) cap;
+    }
+
+    ~Small_Array() {
+        if(data != small)
+            free(data);
+    }
+
+    void clear() {
+        size = 0;
+    }
+
+    void push(T t) {
+        if(size >= capacity) {
+            ASSERT(data != small);
+            capacity = capacity*3/2 + 8;
+            data = realloc(data, capacity*sizeof(T));
+        }
+
+        data[size++] = t;
+    }
+};
+
+template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
+struct Atomic_Map {
+
+    enum Status {
+        EMPTY = 0,
+        FULL = 1,
+        GRAVESTONE = 2
+        INSERTING = 3,
+        MARKED_FOR_DELETE = 8 + 1
+    };
+    
+    struct Slot {
+        std::atomic<uint64_t> refs_status_hash; 
+        uint32_t gen_counter; //max value is reserved
+        Key key;
+        Value value;
+    };
+
+    Slot* slots;
+    uint32_t capacity;
+    uint32_t count;
+
+    bool get(Key const& key, uint32_t hash, Value* out) {
+        struct History {
+            uint32_t hash;
+            uint32_t gen;
+        };
+
+        Small_Array<History, 64> histories[2];
+        for(uint32_t repeat = 0; ; repeat++) {
+
+            Small_Array<History, 64>& history = histories[repeat % 2];
+            Small_Array<History, 64>& prev_history = histories[(repeat + 1) % 2];
+            history.clear();
+
+            uint32_t mask = capacity - 1;
+            uint32_t i = hash & mask;
+            for(uint32_t iter = 1;; iter++) {
+
+                Slot* slot = &slots[i];
+                while(true) {
+                    //check if we are hasha and status matching 
+                    //(this will get rid of 99% of all requests)   
+                    uint64_t curr_ref_status_hash = slot->refs_status_hash.load();
+                    uint32_t curr_status = (curr_ref_status_hash >> 32) & 0xF;
+                    uint32_t curr_hash = curr_ref_status_hash & 0xFFFFFFFF;
+                    if(curr_status == EMPTY)
+                        goto exit_search;
+
+                    if(curr_status != FULL || curr_hash != hash) {
+                        history_push(&history, iter - 1, History{curr_hash, 0}, repeat);
+                        break;
+                    }
+
+                    //try to mark this entry as being looked at. If fail go again
+                    uint64_t new_ref_status_hash = curr_ref_status_hash + (uint64_t) 1 << 36;
+                    if(slot->refs_status_hash.compare_exchange_strong(curr_ref_status_hash, new_ref_status_hash) == false)
+                        continue;
+
+                    uint32_t curr_gen = slot->gen_counter;
+                    history.push(History{curr_hash, curr_gen});
+
+                    //now noone will chnage key or value so we can compare key
+                    //If we fail there was a hash collision (extremely rare)
+                    if(equals(slot->key, key) == false)
+                        break;
+
+                    //else we can copy out the value 
+                    *out = slot->value;
+                    
+                    //and mark the entry as not referenced anymore
+                    uint64_t updated_ref_status_hash = slot->refs_status_hash.fetch_sub((uint64_t) 1 << 36) - (uint64_t) 1 << 36;
+
+                    //if there was a remove operation that happened while we were looking at the key/value
+                    // it has marked this slot as MARKED_FOR_DELETE. If we are the last one referencing a 
+                    // MARKED_FOR_DELETE slot we should remove it by marking it as gravestone
+                    uint32_t updated_status = (updated_ref_status_hash >> 32) & 0xF;
+                    uint32_t updated_refs = updated_ref_status_hash >> 36;
+                    if(updated_status == MARKED_FOR_DELETE && updated_refs == 0)
+                        slot->refs_status_hash.store((uint64_t) GRAVESTONE << 32); 
+
+                    return true;
+                }
+    
+                i = (i + iter) & mask;
+            }   
+
+            exit_search:
+
+            //check if we reached converged state. If we did we can be sure that the 
+            if(repeat > 0 && history.size == prev_history.size) 
+                if(memcmp(history.data, prev_history.data, history.size*sizeof *history.data) == 0)
+                    return false;
+        }
+
+        return false;
+    }
+
+    bool remove(Key const& key, uint32_t hash, Value* out) {
+        while(true) {
+            //check if we are hasha and status matching 
+            //(this will get rid of 99% of all requests)   
+            uint64_t curr_ref_status_hash = refs_status_hash.load();
+            uint32_t curr_status = (curr_ref_status_hash >> 32) & 0xF;
+            uint32_t curr_hash = curr_ref_status_hash & 0xFFFFFFFF;
+            if(curr_status != FULL || curr_hash != hash) 
+                return false;
+
+            //try to mark this entry as being looked at. If fail go again
+            uint64_t new_ref_status_hash = curr_ref_status_hash + (uint64_t) 1 << 36;
+            if(refs_status_hash.compare_exchange_strong(curr_ref_status_hash, new_ref_status_hash) == false)
+                continue;
+
+            //now noone will chnage key or value so we can compare key
+            //If we fail there was a hash collision (extremely rare)
+            if(equals(this->key, key) == false)
+                return false;
+
+            //else we can copy out the value 
+            *out = this->value;
+
+            //change the status to MARKED_FOR_DELETE and mark the entry as not referenced anymore
+            //TODO: perform both as single atomic OP
+            refs_status_hash.fetch_or((uint64_t) MARKED_FOR_DELETE << 32)
+            uint64_t updated_ref_status_hash = refs_status_hash.fetch_sub((uint64_t) 1 << 36) - (uint64_t) 1 << 36;
+
+            //if we are the last one remove it
+            uint32_t updated_status = (updated_ref_status_hash >> 32) & 0xF;
+            uint32_t updated_refs = updated_ref_status_hash >> 36;
+            ASSERT(updated_status == MARKED_FOR_DELETE);
+            if(updated_refs == 0)
+                refs_status_hash.store((uint64_t) GRAVESTONE << 32); 
+
+            return true;
+        }
+
+        return false;
     }
 };
 
