@@ -223,8 +223,9 @@ struct Map_Base {
     }
 
     static uint64_t hash_escape(uint64_t hash) {
-        if(hashed <= REMOVED)
-            hashed += 2;
+        if(hash <= REMOVED)
+            hash += 2;
+        return hash;
     }
 
     void reserve(size_t to_size)
@@ -298,7 +299,7 @@ struct Map_Base {
 template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
 struct Single_Map {
     using Base = Map_Base<Key, Value, equals>;
-    using Entry = Base::Entry;
+    using Entry = typename Base::Entry;
 
     Base base = Base();
     uint64_t seed = 0;
@@ -322,7 +323,7 @@ struct Single_Map {
 template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
 struct Mutex_Map {
     using Base = Map_Base<Key, Value, equals>;
-    using Entry = Base::Entry;
+    using Entry = typename Base::Entry;
 
     Base base = Base();
     uint64_t seed = 0;
@@ -332,21 +333,21 @@ struct Mutex_Map {
     {
         uint64_t hashed = Base::hash_escape(hash_func(key, seed));
         std::shared_lock<std::shared_mutex> lock(mutex);
-        return map.get(key, hashed);
+        return base.get(key, hashed);
     }
     
     bool set(Key const& key, Value value)
     {
         uint64_t hashed = Base::hash_escape(hash_func(key, seed));
         std::unique_lock<std::shared_mutex> lock(mutex);
-        return map.set(key, std::move(value), hashed);
+        return base.set(key, std::move(value), hashed);
     }
 
     bool remove(Key const& key)
     {
         uint64_t hashed = Base::hash_escape(hash_func(key, seed));
         std::unique_lock<std::shared_mutex> lock(mutex);
-        return map.remove(key, hashed);
+        return base.remove(key, hashed);
     }
 };
 
@@ -354,7 +355,7 @@ struct Mutex_Map {
 template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
 struct Distributed_Map {
     using Base = Map_Base<Key, Value, equals>;
-    using Entry = Base::Entry;
+    using Entry = typename Base::Entry;
 
     struct alignas(std::hardware_destructive_interference_size) Shard {
         std::shared_mutex mutex;
@@ -522,9 +523,9 @@ struct Distributed_Map {
     }
 
     static void push_all(std::vector<Entry>* entries, Base* base) {
-        entries.reserve(shard->map.size);
-        for(size_t i = 0; i < shard->map.capacity; i++) {
-            Entry* entry = &shard->map.data[i];
+        entries.reserve(base->size);
+        for(size_t i = 0; i < base->capacity; i++) {
+            Entry* entry = &base->data[i];
             if(entry->used())
                 entries.push(*entry);
         }
@@ -556,11 +557,11 @@ struct Distributed_Map {
                 Shard* other_shard = &shards[i];
                 Shard_Gen* shard_gen = &shard_gens[i];
                 
-                std::shared_lock<std::shared_mutex> lock(shard->mutex);
-                if(shard_gen->generation != shard->map.info_generation) {
-                    shard_gen->generation != shard->map.info_generation; 
+                std::shared_lock<std::shared_mutex> lock(shard_gen->mutex);
+                if(shard_gen->generation != shard_gen->map.info_generation) {
+                    shard_gen->generation != shard_gen->map.info_generation; 
                     shard_gens->entries.clear();
-                    push_all(&shard_gens->entries, &shard->map);
+                    push_all(&shard_gens->entries, &shard_gen->map);
                     had_changes = true;
                 } 
             }
@@ -618,118 +619,15 @@ struct Distributed_Map {
         
         for(size_t i = 0; i < entries.size(); i++) {
             Entry* entry = &entries[i];
-            shard->map.set(std::move(entry->key), std::move(entry->value), entry->hash);
+            shards[i].map.set(std::move(entry->key), std::move(entry->value), entry->hash);
         }
         unlock_all();
     }
 };
 
-
 inline static uint32_t current_thread_id() {
-    return std::hash<std::thread::id>{}(std::this_thread::get_id());
+    return (uint32_t) std::hash<std::thread::id>{}(std::this_thread::get_id());
 }
-
-struct Simple_EBR {
-    struct alignas(std::hardware_destructive_interference_size) Slot {
-        std::atomic<uint32_t> id;
-    };
-
-    Slot* data;
-    uint32_t size; //always power of two
-
-    Simple_EBR(uint32_t requested = std::thread::hardware_concurrency()*3/2){
-        size = 1;
-        while(size < requested)
-            size *= 2;
-
-        data = new Slot[size];
-    } 
-
-    ~Simple_EBR() {
-        delete[] data;
-    }
-
-    struct Lock {
-        uint32_t slot;
-        uint32_t id;
-        Simple_EBR* ebr;
-
-        Lock(Simple_EBR* ebr, uint32_t thread_id = current_thread_id()) : ebr(ebr) {
-            uint32_t mask = ebr->size - 1;
-            uint32_t curr_slot = thread_id & mask;
-
-            for(uint32_t iter = 1; ; iter++) {
-                uint32_t curr_id = ebr->data[curr_slot].id.load();
-                if(curr_id % 2 == 0) {
-                    if(ebr->data[curr_slot].id.compare_exchange_strong(curr_id, curr_id + 1)) {
-                        slot = curr_slot;
-                        id = curr_id + 1;
-                    }
-                }
-
-                curr_slot = (curr_slot + iter) & mask;
-            }
-        }
-
-        ~Lock() {
-            ebr->data[slot].id.store(id + 1);
-        }
-
-        void wait_for_others_to_leave() const 
-        {
-            for(uint32_t i = 0; i < ebr->size; i++) {
-                uint32_t first = ebr->data[i].id.load();
-                uint32_t curr = first;
-                while(curr % 2 == 1 && curr == first) {
-                    curr = ebr->data[i].id.load();
-                    std::this_thread::yield();
-                }
-            }
-            
-            //enum {SMALL = 128};
-            //uint32_t small[SMALL];
-            //uint32_t* history = small;
-            //if(ebr->size > SMALL)
-            //    history = new uint32_t[ebr->size];
-
-            //if(history != small)
-            //    delete[] history;
-        }
-    };
-};
-
-struct Bag {
-    struct Instance {
-        std::atomic<Instance*> next;
-        std::atomic<uint32_t> size;
-        uint32_t capacity;
-        uint32_t* data;
-    };    
-
-    Simple_EBR ebr;
-    std::atomic<Instance*> current_instance;
-    std::atomic<uint32_t> instance_generation;
-
-    void insert(uint32_t data) {
-        
-        while(true)
-        {
-            Simple_EBR::Lock lock(&ebr);
-            uint32_t instance_gen = instance_generation.load();
-            Instance* instance = current_instance.load();
-
-            if(instance->size + 1 > instance->capacity) {
-                Instance new_isntance;
-                
-                instance_gen += 1;
-            }
-            
-            uint32_t new_instance_gen = instance_generation.load();
-            if(instance_gen == new_instance_gen)
-                break;
-        }
-    }
-};
 
 template <typename T, size_t N>
 struct Small_Array {
@@ -739,11 +637,8 @@ struct Small_Array {
     alignas(T) uint8_t small[N*sizeof(T)];
 
     Small_Array(size_t cap = 0) {
-        if(cap <= N)
-            data = (T*) (void*) small;
-        else 
-            data = malloc(cap*sizeof(T));
-        capacity = (uint32_t) cap;
+        capacity = N;
+        reserve(cap);
     }
 
     ~Small_Array() {
@@ -755,164 +650,714 @@ struct Small_Array {
         size = 0;
     }
 
-    void push(T t) {
-        if(size >= capacity) {
-            ASSERT(data != small);
+    void reserve(uint32_t to_cap) {
+        if(to_cap > capacity) {
             capacity = capacity*3/2 + 8;
-            data = realloc(data, capacity*sizeof(T));
-        }
+            if(capacity < to_cap)
+                capacity = to_cap;
 
+            if(data == small) {
+                data = malloc(capacity*sizeof(T));
+                memcpy(data, small, size*sizeof(T));
+            }
+            else {
+                data = realloc(data, capacity*sizeof(T));
+            }
+        }
+    }
+
+    void push(T t) {
+        reserve(size + 1);
         data[size++] = t;
     }
 };
 
-template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
-struct Atomic_Map {
+template <typename T>
+struct Gen_Ptr {
+    std::atomic<uint64_t> val;
+    
+    static_assert(sizeof(T*) == 8);
+    static constexpr uint64_t MULT = ((uint64_t) 1 << 48) / alignof(T);
+    static constexpr uint64_t MAX_GEN = ((uint64_t) 1 << 16) * alignof(T);
+    
+    struct Decompressed {
+        T* ptr;
+        uint64_t gen;
+        uint64_t val;
 
-    enum Status {
-        EMPTY = 0,
-        FULL = 1,
-        GRAVESTONE = 2
-        INSERTING = 3,
-        MARKED_FOR_DELETE = 8 + 1
+        Gen_Ptr<T> encode() const {
+            return Gen_Ptr{Gen_Ptr::encode(ptr, gen)};
+        }
+    };
+
+    static Decompressed decode(uint64_t val) {
+        uint64_t mult = ((uint64_t) 1 << 48) / alignof(T);
+        uint64_t gen = val / mult;
+        uint64_t ptr_num = val % mult;
+        uint64_t ptr = ptr_num * alignof(T);
+
+        //or high bits of ptr to fix up the pointer pattern
+        //by taking bits of the stack pointer. This is achieved by taking adress
+        // of some dummy thats removed by the optimizer.
+        int dummy = 0; dummy = dummy + 0;
+
+        ptr |= ((uint64_t) &dummy) & ((uint64_t) (-1) << 48);
+        return Decompressed{(T*) ptr, gen, val};
+    }
+
+    static uint64_t encode(T* ptr, uint64_t gen) {
+        uint64_t ptr_num = (uint64_t) ptr / alignof(T);
+        uint64_t mult = ((uint64_t) 1 << 48) / alignof(T);
+        uint64_t gen_num = gen * mult;
+        uint64_t out = gen_num | ptr_num;
+        return out;
+    }
+    
+    static Gen_Ptr tick_up(uint64_t val, uint64_t by = 1) {
+        uint64_t mult = ((uint64_t) 1 << 48) / alignof(T);
+        return val + mult;
+    }
+
+    Decompressed decode() const {
+        return decode(val);
+    }
+    
+    Gen_Ptr tick_up(uint64_t by = 1) const {
+        uint64_t mult = ((uint64_t) 1 << 48) / alignof(T);
+        return val + mult;
+    }
+    
+    bool cas(uint64_t old_val, T* ptr) {
+        //uint64_t old_val = val.load(std::memory_order_relaxed);
+        Decompressed decoded = decode();
+        uint64_t new_val = encode(ptr, decoded.gen + 1);
+        return val.compare_exchange_strong(old_val, new_val);
+    }
+
+    void set(T* ptr) {
+        Decompressed decoded = decode(val.load(std::memory_order_relaxed));
+        val = encode(ptr, decoded.gen + 1);
+    }
+    
+    T* get() const {
+        return decode(val).ptr;
+    }
+};
+
+
+//#include "spmc_queue.h"
+
+struct EBR_OLD {
+    struct alignas(std::hardware_destructive_interference_size) Slot {
+        std::atomic<uint64_t> gen_and_taken;
+        std::atomic<uint64_t> thread_id;
+
+        //more or less arbitrary per "thread" payload
+        std::atomic<uint64_t> hash;
+
+    };
+
+    struct Instance {
+        uint64_t capacity;
+        Instance* prev;
+        Slot* slots[];
     };
     
+    std::atomic<Instance*> instance;
+
+    EBR_OLD(size_t initial_capacity = 16) {
+        if(initial_capacity <= 0)
+           initial_capacity = 1; 
+
+
+        TEST(initial_capacity < UINT64_MAX);
+        instance = make_instance(NULL, (uint64_t) initial_capacity);
+    }
+
+    ~EBR_OLD() {
+        Instance* first = this->instance.load();
+        for(Instance* curr = first; curr != NULL; )
+        {
+            Instance* prev = curr->prev;
+            delete_instance(curr);
+            curr = prev;
+        }
+    }
+
+    Slot* lock(uint64_t hash, uint32_t thread_id) {
+        for(uint64_t j = 0; ; j++) {
+            Instance* instance = this->instance.load();
+            ASSERT(instance);
+
+            uint64_t mask = instance->capacity - 1;
+            uint64_t i = thread_id & mask;
+            for(uint64_t iter = 1; iter <= mask; i = (i + 1) & mask) {
+                Slot* slot = instance->slots[i];
+                uint64_t gen_and_taken = slot->gen_and_taken;
+
+                //look for not taken slot
+                if(gen_and_taken % 2 == 0)
+                    //take it
+                    if(slot->gen_and_taken.compare_exchange_strong(gen_and_taken, gen_and_taken | 1)) {
+                        gen_and_taken |= 1;
+
+                        slot->hash = hash;
+                        slot->thread_id = thread_id;
+
+                        //mark as full
+                        slot->gen_and_taken = gen_and_taken + 2;
+                    }
+            }
+            
+            //If we iterated all slots at least once, the instance hasnt changed and we still didnt find
+            // an empty slot, allocate a bigger instance. This new instance contains the same slots
+            // as the old one (we jst copy *pointers* not the contents) but also has some new slots.
+            //Note that ABA cannot happen since we never delete or abandon instances in use.
+            if(j > 0 && instance == this->instance.load()) {
+                Instance* new_instance = make_instance(instance, instance->capacity*2);
+                if(this->instance.compare_exchange_strong(instance, new_instance) == false) {
+                    //if someone made a new instance in the meantime, delete and try again...
+                    delete_instance(new_instance);
+                }
+            }
+        }
+    }
+
+    void unlock(Slot* slot) {
+        //clear the taken bit
+        uint64_t gen_and_taken = slot->gen_and_taken.load(std::memory_order_relaxed);
+        slot->gen_and_taken = gen_and_taken & ~(uint64_t) 1;
+    }
+    
+    static Instance* make_instance(Instance* prev, uint64_t requested_capacity) {
+        uint64_t capacity = prev ? prev->capacity : 1;
+        if(capacity < 1)
+            capacity = 1;
+
+        while(capacity < requested_capacity)
+            capacity *= 2;
+
+        Instance* new_instance = (Instance*) calloc(1, sizeof(Instance) + capacity*sizeof(Slot*));
+        new_instance->capacity = capacity;
+        new_instance->prev = prev;
+
+        if(prev) {
+            for(uint64_t i = 0; i < prev->capacity; i++) 
+                new_instance->slots[i] = prev->slots[i];
+        }
+
+        for(uint64_t i = prev ? prev->capacity : 0; i < capacity; i++) 
+            new_instance->slots[i] = new Slot;
+
+        return new_instance;
+    }
+
+    static void delete_instance(Instance* inst) {
+        for(uint32_t i = inst->prev ? inst->prev->capacity : 0; i < inst->capacity; i++) 
+            delete inst->slots[i];
+        
+        free(inst);
+    }
+    
+    struct Lock {
+        EBR_OLD* ebr;
+        Slot* slot;
+
+        Lock(EBR_OLD& ebr, uint64_t hash, uint32_t thread_id) {
+            this->ebr = &ebr;
+            this->slot = ebr.lock(hash, thread_id);
+        }
+
+        ~Lock() {
+            ebr->unlock(slot);
+        }
+    };
+};
+
+struct EBR {
+    static constexpr uint32_t EMPTY_THREAD_ID = 0;
+    typedef void* (*Create_Node_Func)(void* context);
+    typedef void (*Publish_Node_Func)(void* node, void* context);
+    typedef void (*Delete_Node_Func)(void* node, void* context);
+    
+    struct EBR_Config {
+        size_t node_ebr_offset = 0;
+        Create_Node_Func create_node_func = NULL;
+        Publish_Node_Func publish_node_func = NULL; //optional. Gets called after a node was sucessfully published in a single ebr instance
+        Delete_Node_Func delete_node_func = NULL;
+        void* func_context = NULL;
+        double collect_every_s = 0.016; //16ms = one frame
+    };
+    
+    struct EBR_Node_Data {
+        std::atomic<uint64_t> gen_and_taken;
+        std::atomic<uint64_t> last_access_clock_ns;
+        std::atomic<uint32_t> thread_id;
+    };
+
     struct Slot {
-        std::atomic<uint64_t> refs_status_hash; 
-        uint32_t gen_counter; //max value is reserved
+        std::atomic<uint32_t> id;
+        std::atomic<EBR_Node_Data*> data;
+    };
+
+    struct Instance {
+        uint64_t capacity;
+        Instance* prev;
+        Slot slots[];
+    };
+    
+    std::atomic<Instance*> instance;
+
+    EBR(size_t initial_capacity = 32) {
+        instance = make_instance(NULL, initial_capacity);
+    }
+
+    ~EBR() {
+        Instance* first = this->instance.load();
+        for(Instance* curr = first; curr != NULL; )
+        {
+            Instance* prev = curr->prev;
+            delete_instance(curr);
+            curr = prev;
+        }
+    }
+
+    void node_state(EBR_Config const& config, void* user_data) {
+        EBR_Node_Data* data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+
+        uint32_t thread_id = 0;
+        uint64_t last_access = 0;
+
+        uint64_t gen0 = data->gen_and_taken.load(std::memory_order_acquire);
+        while(true) {
+            thread_id = data->thread_id.load(std::memory_order_relaxed);
+            last_access = data->last_access_clock_ns.load(std::memory_order_relaxed);
+            uint64_t gen1 = data->gen_and_taken.load(std::memory_order_acquire);
+
+            if(gen0 == gen1)
+                break;
+            
+            gen0 = gen1;
+        }
+
+        
+    }
+
+    void* lock(EBR_Config const& config, uint32_t thread_id = current_thread_id()) {
+        for(uint64_t retry = 0; ; retry++) {
+            Instance* instance = this->instance.load();
+            ASSERT(instance);
+
+            uint64_t mask = instance->capacity - 1;
+            uint64_t i = thread_id & mask;
+            for(uint64_t iter = 0; iter <= mask; iter++, i = (i + iter) & mask) {
+                Slot* slot = &instance->slots[i];
+                
+                uint32_t id = slot->id.load(std::memory_order_relaxed);
+                if(id == thread_id) {
+                    //slot->id => slot->data and we can use relaxed since
+                    // if slot->id == thread_id we were the thread that did 
+                    // the storing so that relaxed loads are ordered (from our POV).
+                    //
+                    //BUT! someone else could have overriden this slot thus we dont have to
+                    // be the thread that originally created it. Thats fine though since
+                    // data is immutable, thus it will always be there.
+                    EBR_Node_Data* data = slot->data.load(std::memory_order_relaxed);
+                    ASSERT(data);
+                    
+                    //Even though we are the rightful owners, in the time between 
+                    // the slot->id == thread_id and here, we could have been scheduled out.
+                    //Thus it is entirely possible for this threads slot to be in in the meantime replaced
+                    // by some other thread. We need to ensure that only one thread is doing the storing
+                    // of the data to ensure integrity. Thus we CAS fight over the taken flag
+                    uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
+                    if(gen_and_taken % 4 == 0)
+                        if(data->gen_and_taken.compare_exchange_strong(gen_and_taken, gen_and_taken + 1, 
+                            std::memory_order_acquire, std::memory_order_relaxed
+                        )) {
+                            printf("TID %08llx found itself in slot #%lli\n", (long long) thread_id, (long long) i);
+                            data->last_access_clock_ns.store(clock_ns(), std::memory_order_relaxed);
+                            data->thread_id.store(thread_id, std::memory_order_relaxed);
+
+                            //if accidentally stole this slot then repair it
+                            // (can happen when slot->id == thread_id succeeds, then we go to sleep,
+                            // another thread replaces us, does full lock + unlock sequence, then we wake
+                            // up and also successfully CAS gen_and_taken, yet by this point the thread id
+                            // differs).
+                            if(slot->id.load(std::memory_order_relaxed) != thread_id)
+                                slot->id.store(thread_id, std::memory_order_relaxed);
+
+
+                            //mark as full
+                            data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_release);
+                            printf("TID %08llx locked in slot #%lli\n", (long long) thread_id, (long long) i);
+
+                            void* user_data = (uint8_t*) data - config.node_ebr_offset;
+                            return user_data;
+                        }
+                }
+            }
+            
+            //we didnt find ourselves => slow path
+            printf("TID %08llx didnt find anything... attempting to insert\n", (long long) thread_id);
+
+            //because the above for loop can take a long time
+            // reload instance, mask etc (better to stay relevant than have to redo work later on)
+            instance = this->instance.load();
+            mask = instance->capacity - 1;
+            uint64_t max_distance = mask/4; //we want to be able find our slot relatively quickly
+            
+            int64_t collect_every_ns = (int64_t) (config.collect_every_s*1e9);
+
+            //try to add oneself to an empty slot or replace some slots that are:
+            // 1) in EMPTY state
+            // 2) accessed more than collect_every_ns ago
+            i = thread_id & mask;
+            for(uint64_t iter = 0; iter <= max_distance; iter++, i = (i + iter) & mask) {
+                Slot* slot = &instance->slots[i];
+
+                uint32_t id = slot->id.load();
+                EBR_Node_Data* data = slot->data.load();
+                if(data == NULL) {
+
+                    void* user_data = config.create_node_func(config.func_context);
+
+                    EBR_Node_Data* new_data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+                    new_data->thread_id.store(EMPTY_THREAD_ID, std::memory_order_relaxed);
+                    if(slot->data.compare_exchange_strong(data, new_data) == false)
+                        config.delete_node_func(user_data, config.func_context);
+                    else if(config.publish_node_func)
+                        config.publish_node_func(user_data, config.func_context);
+
+                    data = slot->data.load();
+                    printf("TID %08llx helped allocate EBR_Node_Data 0x%p\n", (long long) thread_id, data);
+                }
+                ASSERT(data);
+                
+                uint64_t now = clock_ns();
+                uint64_t gen_and_taken = data->gen_and_taken.load();
+                uint64_t last_access_clock_ns = data->last_access_clock_ns.load();
+                int64_t ago = (int64_t) (now - last_access_clock_ns);
+
+                if(gen_and_taken % 4 == 0 && (id == EMPTY_THREAD_ID || ago > collect_every_ns)) {
+                    if(data->gen_and_taken.compare_exchange_strong(gen_and_taken, gen_and_taken + 1)) {
+                        if(id == EMPTY_THREAD_ID)
+                            printf("TID %08llx placed in an empty slot #%lli\n", (long long) thread_id, (long long) i);
+                        else
+                            printf("TID %08llx replaced last thread %08llx last used %es ago in slot #%lli\n", (long long) thread_id, (long long) data->thread_id, ago*1e-9, (long long) i);
+                            
+
+                        data->last_access_clock_ns.store(clock_ns());
+                        data->thread_id.store(thread_id);
+                        slot->id.store(thread_id);
+
+                        //mark as full
+                        data->gen_and_taken.store(gen_and_taken + 2);
+                        
+                        void* user_data = (uint8_t*) data - config.node_ebr_offset;
+                        return user_data;
+                    }
+                }
+            }
+
+            //If we iterated all slots at least once, the instance hasnt changed and we still didnt find
+            // an empty slot, allocate a bigger instance. This new instance contains the same EBR_Node_Data
+            // as the old one (we jst copy pointers) but also has some new slots.
+            //All slots (even the ones that point to the old EBR_Node_Data) dont have their TIDs set, thus threads
+            // will fight again over the slots.
+            //Note that ABA cannot happen since we never delete or abandon instances in use.
+            if(instance == this->instance.load()) {
+                printf("TID %08llx making instance of size %lli\n", (long long) thread_id, (long long) instance->capacity*2);
+                Instance* new_instance = make_instance(instance, instance->capacity*2);
+                if(this->instance.compare_exchange_strong(instance, new_instance) == false) {
+                    //if someone made a new instance in the meantime, delete and try again...
+                    delete_instance(new_instance);
+                    printf("TID %08llx making instance of size %lli failed... retrying lock %llix\n", (long long) thread_id, (long long) instance->capacity*2, (long long) retry);
+                }
+                else {
+                    printf("TID %08llx making instance of size %lli success... retrying lock %llix\n", (long long) thread_id, (long long) instance->capacity*2, (long long) retry);
+                }
+            }
+        }
+    }
+
+    void unlock(EBR_Config const& config, void* user_data) 
+    {
+        EBR_Node_Data* data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+
+        uint32_t tid = data->thread_id.load(std::memory_order_relaxed);
+        printf("TID %08llx unlocked\n", (long long) tid);
+        
+        //clear the taken bit
+        uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
+        ASSERT(gen_and_taken % 4 == 2);
+        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_relaxed);
+    }
+    
+    Instance* make_instance(Instance* prev, uint64_t requested_capacity) 
+    {
+        uint64_t capacity = prev ? prev->capacity : 1;
+        if(capacity < 1)
+            capacity = 1;
+
+        while(capacity < requested_capacity)
+            capacity *= 2;
+
+        Instance* new_instance = (Instance*) calloc(1, sizeof(Instance) + capacity*sizeof(Slot));
+        TEST(new_instance != NULL);
+        new_instance->capacity = capacity;
+        new_instance->prev = prev;
+        if(prev) {
+            for(uint64_t i = 0; i < prev->capacity; i++) {
+                new_instance->slots[i].id.store(EMPTY_THREAD_ID, std::memory_order_relaxed);
+                new_instance->slots[i].data.store(prev->slots[i].data.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+        }
+
+        for(uint64_t i = prev ? prev->capacity : 0; i < capacity; i++) {
+            new_instance->slots[i].id.store(EMPTY_THREAD_ID, std::memory_order_relaxed);
+            new_instance->slots[i].data.store(NULL, std::memory_order_relaxed);
+        }
+
+        return new_instance;
+    }
+    
+    void delete_instance(Instance* inst) {
+        //if(delete_node_func != NULL)
+        //    for(uint64_t i = inst->prev ? inst->prev->capacity : 0; i < inst->capacity; i++)  {
+        //        EBR_Node_Data* data = inst->slots[i].data.load(std::memory_order_relaxed);
+        //        void* user_data = (uint8_t*) data - node_ebr_offset;
+        //        delete_node_func(user_data, func_context);
+        //    }
+
+        free(inst);
+    }
+
+    struct Lock {
+        EBR* ebr;
+        void* data;
+        const EBR_Config* config;
+
+        Lock(EBR& ebr, EBR_Config const* config, uint32_t thread_id = current_thread_id()) {
+            this->ebr = &ebr;
+            this->data = ebr.lock(*config, thread_id);
+            this->config = config;
+        }
+
+        ~Lock() {
+            ebr->unlock(*config, data);
+        }
+    };
+    
+    
+    struct Private_Lock {
+        EBR* ebr;
+        EBR_Node_Data* data;
+        uint64_t gen_and_taken;
+
+        Private_Lock(EBR& ebr, EBR_Config const& config, uint32_t thread_id = current_thread_id()) {
+            this->ebr = &ebr;
+            this->data = ebr.lock(thread_id);
+        }
+
+        ~Private_Lock() {
+            ebr->unlock(data);
+        }
+    };
+
+    uint64_t private_lock(EBR_Node_Data* data, uint64_t clock_val = clock_ns(), uint32_t thread_id = current_thread_id()) {
+        uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
+        data->gen_and_taken.store(gen_and_taken + 1, std::memory_order_relaxed);
+
+        data->last_access_clock_ns.store(clock_val, std::memory_order_relaxed);
+        data->thread_id.store(thread_id, std::memory_order_relaxed);
+
+        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_release);
+        return gen_and_taken + 2;
+    }
+
+    void private_unlock(EBR_Node_Data* data, uint64_t gen_and_taken) {
+        ASSERT(gen_and_taken % 4 == 2);
+        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_relaxed);
+    }
+};
+
+
+struct Collection {
+    struct Thread_Private;
+
+    EBR ebr;
+    Thread_Private* thread_data;
+    uint32_t ref_count;
+    
+    struct Node {
+        Node* next;
+        int data;
+    };
+    struct Thread_Private {
+        EBR::EBR_Node_Data ebr_data;
+        Collection* central;
+        Thread_Private* next;
+        Node* removed_nodes;
+        bool is_private;
+        bool is_deleted;
+    };
+    
+    void cleanup(Collection* central, Thread_Private* self) {
+        std::shared_ptr<int> p;
+    }
+    
+    static void* create_thread_private(void* context)
+    {
+        return new Thread_Private();
+    }
+    
+    static void delete_thread_private(void* node, void* context)
+    {
+        delete (Thread_Private*) node;
+    }
+    
+    static void publish_thread_private(void* node, void* context)
+    {
+        Thread_Private* tprivate = (Thread_Private*) node;
+        Collection* central = (Collection*) context;
+        tprivate->next = central->thread_data; 
+        central->thread_data = tprivate;
+    }
+};
+
+
+template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
+struct Atomic_Map2 {
+
+    struct Node {
+        Gen_Ptr<Node*> next; 
+        uint64_t hash;
         Key key;
         Value value;
     };
 
-    Slot* slots;
-    uint32_t capacity;
-    uint32_t count;
+    Gen_Ptr<Node*>* buckets;
+    uint64_t capacity;
+    EBR ebr;
 
-    bool get(Key const& key, uint32_t hash, Value* out) {
-        struct History {
-            uint32_t hash;
-            uint32_t gen;
-        };
+    bool get(Key const& key, uint64_t hash, Value* out) const {
+        EBR::Lock lock(ebr, hash, 0);
 
-        Small_Array<History, 64> histories[2];
-        for(uint32_t repeat = 0; ; repeat++) {
+        //TODO: repeat with instances...
 
-            Small_Array<History, 64>& history = histories[repeat % 2];
-            Small_Array<History, 64>& prev_history = histories[(repeat + 1) % 2];
-            history.clear();
+        uint64_t bucket_i = hash & (capacity - 1);
+        Gen_Ptr<Node*>* bucket = &buckets[bucket_i];
 
-            uint32_t mask = capacity - 1;
-            uint32_t i = hash & mask;
-            for(uint32_t iter = 1;; iter++) {
+        //do classic multiple repeats
+        uint64_t prev_bucket_gen = (uint64_t) -1;
+        for(uint64_t rep = 0; ; rep++) {
+            Gen_Ptr<Node*> curr = *bucket;
 
-                Slot* slot = &slots[i];
-                while(true) {
-                    //check if we are hasha and status matching 
-                    //(this will get rid of 99% of all requests)   
-                    uint64_t curr_ref_status_hash = slot->refs_status_hash.load();
-                    uint32_t curr_status = (curr_ref_status_hash >> 32) & 0xF;
-                    uint32_t curr_hash = curr_ref_status_hash & 0xFFFFFFFF;
-                    if(curr_status == EMPTY)
-                        goto exit_search;
+            //There were no insertions iff gen counter hasnt moved
+            // thus if two generations are equal we know that nothing new was added
+            uint64_t curr_gen = curr.decode().gen;
+            if(curr_gen == prev_bucket_gen) //&& instance == instance...
+                break;
 
-                    if(curr_status != FULL || curr_hash != hash) {
-                        history_push(&history, iter - 1, History{curr_hash, 0}, repeat);
-                        break;
-                    }
+            //iterate all nodes in this bucket
+            for(uint64_t iter = 0; ; iter++) {
+                typename Gen_Ptr<Node*>::Decompressed curr_d = curr.decode();
+                Node* node = curr_d.ptr;
+                if(node == NULL) 
+                    break;
 
-                    //try to mark this entry as being looked at. If fail go again
-                    uint64_t new_ref_status_hash = curr_ref_status_hash + (uint64_t) 1 << 36;
-                    if(slot->refs_status_hash.compare_exchange_strong(curr_ref_status_hash, new_ref_status_hash) == false)
-                        continue;
-
-                    uint32_t curr_gen = slot->gen_counter;
-                    history.push(History{curr_hash, curr_gen});
-
-                    //now noone will chnage key or value so we can compare key
-                    //If we fail there was a hash collision (extremely rare)
-                    if(equals(slot->key, key) == false)
-                        break;
-
-                    //else we can copy out the value 
-                    *out = slot->value;
-                    
-                    //and mark the entry as not referenced anymore
-                    uint64_t updated_ref_status_hash = slot->refs_status_hash.fetch_sub((uint64_t) 1 << 36) - (uint64_t) 1 << 36;
-
-                    //if there was a remove operation that happened while we were looking at the key/value
-                    // it has marked this slot as MARKED_FOR_DELETE. If we are the last one referencing a 
-                    // MARKED_FOR_DELETE slot we should remove it by marking it as gravestone
-                    uint32_t updated_status = (updated_ref_status_hash >> 32) & 0xF;
-                    uint32_t updated_refs = updated_ref_status_hash >> 36;
-                    if(updated_status == MARKED_FOR_DELETE && updated_refs == 0)
-                        slot->refs_status_hash.store((uint64_t) GRAVESTONE << 32); 
-
+                if(node->hash == hash && equals(node->key, key))
+                {
+                    if(out)
+                        *out = node->value;
                     return true;
                 }
-    
-                i = (i + iter) & mask;
-            }   
 
-            exit_search:
-
-            //check if we reached converged state. If we did we can be sure that the 
-            if(repeat > 0 && history.size == prev_history.size) 
-                if(memcmp(history.data, prev_history.data, history.size*sizeof *history.data) == 0)
-                    return false;
+                curr = curr_d.next;
+            }
+            
+            prev_bucket_gen = curr_gen;
         }
 
         return false;
     }
+    
+    bool set(Key const& key, uint64_t hash, Value value) {
+        Node* new_node = new Node(0, hash, key, std::move(value));
 
-    bool remove(Key const& key, uint32_t hash, Value* out) {
-        while(true) {
-            //check if we are hasha and status matching 
-            //(this will get rid of 99% of all requests)   
-            uint64_t curr_ref_status_hash = refs_status_hash.load();
-            uint32_t curr_status = (curr_ref_status_hash >> 32) & 0xF;
-            uint32_t curr_hash = curr_ref_status_hash & 0xFFFFFFFF;
-            if(curr_status != FULL || curr_hash != hash) 
-                return false;
+        EBR::Lock lock(ebr, hash, 0);
 
-            //try to mark this entry as being looked at. If fail go again
-            uint64_t new_ref_status_hash = curr_ref_status_hash + (uint64_t) 1 << 36;
-            if(refs_status_hash.compare_exchange_strong(curr_ref_status_hash, new_ref_status_hash) == false)
-                continue;
-
-            //now noone will chnage key or value so we can compare key
-            //If we fail there was a hash collision (extremely rare)
-            if(equals(this->key, key) == false)
-                return false;
-
-            //else we can copy out the value 
-            *out = this->value;
-
-            //change the status to MARKED_FOR_DELETE and mark the entry as not referenced anymore
-            //TODO: perform both as single atomic OP
-            refs_status_hash.fetch_or((uint64_t) MARKED_FOR_DELETE << 32)
-            uint64_t updated_ref_status_hash = refs_status_hash.fetch_sub((uint64_t) 1 << 36) - (uint64_t) 1 << 36;
-
-            //if we are the last one remove it
-            uint32_t updated_status = (updated_ref_status_hash >> 32) & 0xF;
-            uint32_t updated_refs = updated_ref_status_hash >> 36;
-            ASSERT(updated_status == MARKED_FOR_DELETE);
-            if(updated_refs == 0)
-                refs_status_hash.store((uint64_t) GRAVESTONE << 32); 
-
-            return true;
+        uint64_t bucket_i = hash & (capacity - 1);
+        Gen_Ptr<Node*>* bucket = &buckets[bucket_i];
+        
+        typename Gen_Ptr<Node*>::Decompressed curr_bucket;
+        while(false) {
+            //NOTE: this is a ginat mess! better to unroll everything at this point!
+            curr_bucket = bucket->decode();
+            new_node->next.set(curr_bucket.ptr);
+            if(bucket->cas(curr_bucket.val, new_node))
+                break;
         }
 
-        return false;
+        //iterate nodes after and delete any that match the key
+        bool had = remove_from(&new_node->next, curr_bucket.ptr, key, hash);
+        return had;
+    }
+
+    bool remove(Key const& key, uint64_t hash) {
+        uint64_t bucket_i = hash & (capacity - 1);
+        Gen_Ptr<Node*>* bucket = &buckets[bucket_i];
+        return remove_from(bucket, bucket->decode().ptr, key, hash);
+    }
+
+    bool remove_from(Gen_Ptr<Node*>* first_prev, Node* first_node, Key const& key, uint64_t hash) {
+        struct Rem {
+            Gen_Ptr<Node*>* prev;
+            Node* node;
+            Node* next;
+            uint64_t prev_val;
+        };
+        
+        uint64_t deleted = 0;
+        Small_Array<Rem, 16> to_delete;
+        while(true) {
+            Gen_Ptr<Node*>* prev = first_prev;
+            Node* node = first_node;
+
+            for(uint64_t iter = 0; node != NULL; iter++) {
+                Node* next = node->next.decode().ptr;
+
+                if(node->hash == hash && equals(node->key, key))
+                    to_delete.push(Rem{prev, node, next});
+
+                prev = &node->next;
+                node = next;
+            }
+        
+            //NOTE: is all_ok necessary? 
+            // -> it largely doesnt matter since its so rare for two deletes to race
+            bool all_ok = true;
+            for(uint32_t i = to_delete.size; i-- > 0;) {
+                Rem pair = to_delete.data[i];
+                if(pair.prev->cas(pair.prev_val, pair.next)) {
+                    
+                    deleted += 1;
+                }
+                else
+                    all_ok = false;
+            }
+
+            if(all_ok)
+                break;
+                
+            to_delete.clear();
+        }
+
+        return deleted > 0;
     }
 };
 
-void test(Simple_EBR* ebr) {
-    
-    Simple_EBR::Lock lock(ebr);
-
-    lock.wait_for_others_to_leave();
-
-}
 
 struct Tracker_Node;
 static std::atomic<Tracker_Node*> _current_installed_tracker;
@@ -1032,8 +1477,21 @@ static inline uint64_t raii_tracker_hash(Tracker<T> const& tracker, uint64_t see
 
 }
 
-int main()
+void test_gen_ptr()
 {
+    int a = 0; a = a + 0;
+    int b = 1; b = b + 0;
+
+    Gen_Ptr<int> ptr = {};
+    ptr.set(&a);
+    ASSERT(ptr.decode().ptr == &a);
+
+    Gen_Ptr<int> roundtrip = ptr.decode().encode();
+    ASSERT(ptr.val == roundtrip.val);
+}
+
+void test_tracker() {
+
     Tracker_Node node;
     {
         auto t1 = Tracker<int>(1);
@@ -1044,18 +1502,35 @@ int main()
 
         auto t3 = t2;
     }
-
     node.dump();
-    std::cout << "Hello World!\n";
 }
 
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
+void test_ebr()
+{
+    EBR ebr(1e9, 1);
 
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
+
+    {
+        EBR::Lock lock(ebr, 1);
+    }
+    
+    {
+        EBR::Lock lock(ebr, 2);
+    }
+    
+    {
+        ebr.collect_every_ns = 0;
+        EBR::Lock lock(ebr, 33);
+        EBR::Lock lock1(ebr, 1);
+        EBR::Lock lock2(ebr, 2);
+    }
+}
+
+int main()
+{
+    test_gen_ptr();
+    test_tracker();
+    test_ebr();
+
+    std::cout << "All done";
+}
