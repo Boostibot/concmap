@@ -132,6 +132,7 @@
     <ClCompile Include="concmap.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="benchmarks.h" />
     <ClInclude Include="spmc_queue.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

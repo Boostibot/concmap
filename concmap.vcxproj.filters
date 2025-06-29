@@ -23,5 +23,8 @@
     <ClInclude Include="spmc_queue.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="benchmarks.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

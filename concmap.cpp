@@ -1,5 +1,6 @@
 
 
+#if 0
 #include <stdint.h>
 #include <string.h>
 
@@ -743,7 +744,6 @@ struct Gen_Ptr {
         return decode(val).ptr;
     }
 };
-
 
 //#include "spmc_queue.h"
 
@@ -1533,4 +1533,12 @@ int main()
     test_ebr();
 
     std::cout << "All done";
+}
+
+#endif
+
+#include "benchmarks.h"
+
+int main() {
+    bench_all();
 }
