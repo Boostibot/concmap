@@ -4,154 +4,202 @@ import csv
 import math
 import sys
 import os 
-from typing import List,Dict
+import inspect
+from typing import List,Dict,Any,Tuple
 
-class Raw_Bench_File:
-    name:str = ""
-    threads:int = 0
-    trials:int = 0
-    records:np.ndarray = np.array([])
+def group(arr: list, key:Any, astype=list, sort=False)-> List[list] | Dict[Any, list]: 
+    grouped = []
 
-    def __init__(self, name:str, threads:int, trials:int):
-        self.name = name
-        self.threads = threads
-        self.trials = trials
-        self.records = np.zeros(shape=(threads, trials, 3))
-
-class Median_Bench_File:
-    name:str = ""
-    threads:int = 0
-    trials:int = 0
-    records:np.ndarray = np.array([])
+    if sort:
+        arr = sorted(arr, key=key)
+    sig = inspect.signature(key)
+    prev = None
+    first = True
+    if len(sig.parameters) == 1:
+        if astype == list:
+            for item in arr:
+                new_prop = key(item)
+                if first or prev != new_prop:
+                    grouped.append([])
+                    prev = new_prop
+                    first = False
+                grouped[-1].append(item)
+        elif astype == dict:
+            grouped = {}
+            for item in arr:
+                new_prop = key(item)
+                if first or prev != new_prop:
+                    grouped[new_prop] = []
+                    prev = new_prop
+                    first = False
+                grouped[new_prop].append(item)
+    elif len(sig.parameters) == 1:
+        for item in arr:
+            if first or bool(key(prev, item)):
+                grouped.append([])
+                prev = item
+                first = False
+            grouped[-1].append(item)
+    else:
+        raise TypeError("bad function args")
     
-    def __init__(self, name:str, threads:int, trials:int):
-        self.name = name
-        self.threads = threads
-        self.trials = trials
-        self.records = np.zeros(shape=(threads, 3))
+    return grouped
 
-class Sum_Bench_File:
-    name:str = ""
+def average(arr:Any, by:Any=None):
+    if by == None:
+        return sum(arr)/len(arr)
+    else:
+        sum_map = sum(map(by, arr))
+        return sum_map/len(arr)
+
+def median(arr:Any, key:Any=None):
+    l = len(arr)
+    if l == 0:
+        return None
+    
+    s = sorted(arr, key=key)
+    s0 = s[(l - 1)//2]
+    s1 = s[l//2]
+    if isinstance(s0, str):
+        return s0
+    else:
+        return (s0 + s1) / 2 
+
+class Bench_Result:
+    bench_name:str = ""
+    thread_name:str = ""
+    thread_index:int = 0
     threads:int = 0
     trials:int = 0
-    iters:int = 0
-    okays:int = 0
-    duration:int = 0 
-    
-    def __init__(self, name:str, threads:int, trials:int):
-        self.name = name
-        self.threads = threads
-        self.trials = trials
+    summed:int = 1
+    records:List[np.ndarray] = []
 
-def load_raw_bench_file(path:str) -> List[Raw_Bench_File]:
-    def at_or(arr, i, or_val=0, type=float):
+def load_bench_result(path:str) -> Tuple[List[Bench_Result], List[Any]]:
+    errors=[]
+    bench_files = []
+    def at_or(arr, i, or_val, astype=None):
+        if astype == None:
+            astype = type(or_val)
         try:
-            return type(arr[i])
-        except (ValueError, IndexError):
+            return astype(arr[i])
+        except (ValueError, IndexError) as e:
+            nonlocal errors
+            errors.append((arr, i, or_val, astype, e))
             return or_val
 
-    bench_files = []
     with open(path,'r') as csvfile: 
-        rows = csv.reader(csvfile, delimiter = ',') 
-
-        bench_file = None
-
-        prev_chunk_start = 0
-        next_chunk_start = 1
+        rows = csv.reader(csvfile, delimiter = ',', skipinitialspace=True) 
+        had_first = False
         for i, row in enumerate(rows): 
-            # first line is a comment
-            if i == 0:
+            # Allow blanks
+            if len(row) == 0:
                 continue
 
-            # next are either blanks, headers, or body
-            if i == next_chunk_start:
-                # if is blank then assume next is header
-                if len(row) == 0:
-                    next_chunk_start += 1
-                    continue
+            # first line is a comment
+            if had_first == False and len(row) <= 1:
+                had_first = True
+                continue
 
-                name = at_or(row, 0, "", str)
-                threads = at_or(row, 1, type=int)
-                trials = at_or(row, 2, type=int)
-
-                prev_chunk_start = next_chunk_start
-                next_chunk_start = i + 1 + threads
-                bench_file = Raw_Bench_File(name, threads, trials)
-                bench_files += [bench_file]
-            # else is header
+            # regular line 
             else:
-                assert bench_file != None
+                had_first = True
 
-                th = i - prev_chunk_start - 1
-                for tri in range(bench_file.trials):
-                    bench_file.records[th, tri, 0] = at_or(row, 3*tri+0)
-                    bench_file.records[th, tri, 1] = at_or(row, 3*tri+1)
-                    bench_file.records[th, tri, 2] = at_or(row, 3*tri+2)
+                be = Bench_Result() 
+                be.bench_name = at_or(row, 0, "ERROR")
+                be.thread_name = at_or(row, 1, "ERROR")
+                be.thread_index = at_or(row, 2, 0)
+                be.threads = at_or(row, 3, 0)
+                be.trials = at_or(row, 4, 0)
+                be.records = []
+                for tri in range(be.trials):
+                    record = np.array([
+                        at_or(row, 5 + 3*tri+0, 0),
+                        at_or(row, 5 + 3*tri+1, 0),
+                        at_or(row, 5 + 3*tri+2, 0),
+                    ])
+                    be.records.append(record)
 
-    return bench_files        
+                bench_files.append(be)
 
-def median_bench_file(be:Raw_Bench_File) -> Median_Bench_File:
-    out = Median_Bench_File(be.name, be.threads, be.trials)
-    for th in range(be.threads):
-        trials = []
-        for tri in range(be.trials):
-            trials.append(be.records[th, tri, :])
+    return (bench_files, errors)        
 
-        trials.sort(key=lambda record: record[1]/record[2])
-        median = (trials[len(trials)//2] + trials[(len(trials) + 1)//2]) / 2 
-        out.records[th, :] = median
-
+def median_bench_result(be:Bench_Result) -> Bench_Result:
+    out = Bench_Result()
+    out.bench_name = be.bench_name
+    out.thread_name = be.thread_name
+    out.thread_index = be.thread_index
+    out.threads = be.threads
+    out.trials = be.trials
+    out.records = [median(be.records, key=lambda record: record[1]/record[2])]
     return out
 
-def sum_bench_file(be:Median_Bench_File) -> Sum_Bench_File:
-    out = Sum_Bench_File(be.name, be.threads, be.trials)
-    sum = np.sum(be.records, axis=0)
-    out.iters = sum[0]
-    out.okays = sum[1]
-    out.duration = sum[2]
-
+def sum_bench(bes:List[Bench_Result]) -> Bench_Result:
+    out = Bench_Result()
+    if len(bes) == 0:
+        return out
+    
+    out.bench_name = median([be.bench_name for be in bes])
+    out.thread_name = median([be.thread_name for be in bes])
+    out.thread_index = median([be.thread_index for be in bes])
+    out.threads = median([be.threads for be in bes])
+    out.trials = median([be.trials for be in bes])
+    out.records = [sum([sum(be.records) for be in bes])]
+    out.summed = len(bes)
     return out
 
 class Grouped_Bench_Files:
     threads: List[int] = []
     trials: List[int] = []
+    summed: List[int] = []
     iters: List[int] = []
     okays: List[int] = []
     duration: List[int] = []
 
-def group_bench_sum_files(bes: List[Sum_Bench_File]) -> Dict[str, Grouped_Bench_Files]:
-    if len(bes) == 0:
-        return []
+def group_sum_bench_files(bes: List[Bench_Result]) -> Dict[str, Dict[str, Grouped_Bench_Files]]:
+    grouped_by_benchmark = {}
     
-    same_names = sorted(bes, key=lambda x: x.name)
-    grouped:List[List[Sum_Bench_File]] = []
-    name = None
-    for be in same_names:
-        if name != be.name:
-            grouped += [[]]
-            name = be.name
-        grouped[-1] += [be]
+    # if is not medianed already, median
+    med = [median_bench_result(be) for be in bes]
 
-    out:Dict[str, Grouped_Bench_Files] = {}
-    for group in grouped:
-        new = Grouped_Bench_Files()
-        new.threads = np.array([be.threads for be in group], dtype=int)
-        new.trials = np.array([be.trials for be in group], dtype=int)
-        new.iters = np.array([be.iters for be in group], dtype=int)
-        new.okays = np.array([be.okays for be in group], dtype=int)
-        new.duration = np.array([be.duration for be in group], dtype=float)*1e-9
-        out[group[0].name] = new
+    # group by benchmark name and iterate each group
+    by_bench = group(med, lambda be: be.bench_name, astype=dict, sort=True)
+    for bench_name,benchmark in by_bench.items():
 
-    return out
+        # group each bencmark by thread name
+        grouped_by_thread_name = {}
+        by_name = group(benchmark, lambda be: be.thread_name, astype=dict, sort=True)
+        for thread_name,thread in by_name.items():
+            
+            # finally group each thread by number of threads and sum within each category
+            by_threads = group(thread, lambda be: be.threads, astype=list, sort=True)
+            summed:List[Bench_Result] = [sum_bench(by_thread) for by_thread in by_threads]
 
-raws: List[Raw_Bench_File] = load_raw_bench_file("bench_data/bench.csv")
-medians: List[Median_Bench_File] = [median_bench_file(be) for be in raws]
-sums: List[Sum_Bench_File] = [sum_bench_file(be) for be in medians]
-grouped = group_bench_sum_files(sums)
+            # transpose summed list for easier work
+            g = Grouped_Bench_Files()
+            g.threads = np.array([s.threads for s in summed])
+            g.trials = np.array([s.trials for s in summed])
+            g.summed = np.array([s.summed for s in summed])
+            g.iters = np.array([s.records[0][0] for s in summed])
+            g.okays = np.array([s.records[0][1] for s in summed])
+            g.duration = np.array([s.records[0][2] for s in summed])*1e-9
 
-print(list(grouped.keys()))
+            grouped_by_thread_name[thread_name] = g
+        grouped_by_benchmark[bench_name] = grouped_by_thread_name
 
-def plot_simple_comp(save=None):
+    return grouped_by_benchmark
+
+
+
+def deref(map, arr_or_key):
+    if isinstance(arr_or_key, list):
+        curr = map
+        for a in arr_or_key:
+            curr = curr[a]
+        return curr
+    else:
+        return map[arr_or_key]
+    
+def simple_plot(grouped, names, labels=None, save=None, scale="normal", mode="throughput", title=None):
     fig = plt.figure(figsize=(11, 10))
     ax = fig.add_subplot(111)
     ax.tick_params(axis='both', which='major', pad=5)
@@ -159,25 +207,94 @@ def plot_simple_comp(save=None):
     linewidth = 1.5
     pointsize = 3
     
-    names = ["load", "store", "faa", "and", "cas_all", "cas_success", "lock", "read_lock", "write_lock"]
-    # names = ["faa_delay000", "faa_delay100", "faa_delay200", "faa_delay400"]
-    for name in names:
-        if name in grouped:
-            group = grouped[name]
-            # ax.plot(group.threads, group.okays/(group.duration/group.threads)*1e-6, linestyle='-', marker='s', label=name, markersize=pointsize, linewidth=linewidth)
-            ax.plot(group.threads, group.okays/group.duration*1e-6, linestyle='-', marker='s', label=name, linewidth=linewidth)
+    ticks = []
+    for i,name in enumerate(names):
+        try:
+            group = deref(grouped, name)
+            if isinstance(group, dict) == False:
+                group = {"":group}
 
-    ax.set_yscale('log', base=2)
-    plt.xticks(list(grouped.values())[0].threads)
+            for k,v in group.items():
+                ticks = v.threads
+                label = labels[i] if labels != None else str(name) + k
+                to_plot = []
+                if mode == "throughput":
+                    to_plot = v.okays/(v.duration/v.summed)
+                elif mode == "efficiency":
+                    to_plot = v.okays/(v.duration)
+
+                ax.plot(v.threads, to_plot*1e-6, linestyle='-', marker='s', label=label, markersize=pointsize, linewidth=linewidth)
+        except IndexError as e:
+            print(f"Error: {e=}")
+            None
+
+    if scale=="log":
+        ax.set_yscale('log', base=2)
+    plt.xticks(ticks)
     # plt.yticks(Ys)
     plt.xlabel('threads') 
     plt.ylabel('Mops/s', rotation="horizontal") 
+    if title != None:
+        plt.title(title)
     plt.grid()
     plt.legend() 
     if save != None:
-        plt.savefig(save, bbox_inches='tight', pad_inches=0.0, dpi=180)
+        plt.savefig(save, bbox_inches='tight', dpi=180)
     else:
         plt.show() 
 
-# plot_simple_comp("plot.png")
-plot_simple_comp("plotlog.png")
+
+records_atomic, errors_atomic = load_bench_result("bench_data/bench_atomic.csv")
+records_delay, errors_delay = load_bench_result("bench_data/bench_delay.csv")
+records_pressure, errors_pressure = load_bench_result("bench_data/bench_pressure.csv")
+
+redords = records_atomic + records_delay + records_pressure
+grouped = group_sum_bench_files(redords)
+
+group_names = {bench_name:list(benchmark.keys()) for bench_name,benchmark in grouped.items()}
+print(group_names)
+
+save = True
+simple_plot(
+    grouped, 
+    names= ["load", "store", "exchange", "faa", "and", "bts", "cas_all", "cas_success", "lock", "read_lock", "write_lock"],
+    save="bench_data/ops_all_with_load_store.png" if save else None
+)
+simple_plot(
+    grouped, 
+    names= ["faa", "exchange", "and", "bts", "cas_all", "cas_success", "lock", "read_lock", "write_lock"], 
+    save="bench_data/ops_all.png" if save else None
+)
+simple_plot(grouped, ["cas_delay0", "cas_delay1", "cas_delay2", "cas_delay4"])
+
+simple_plot(
+    grouped,  
+    names = [["store_loadp", "op"], ["exchange_loadp", "op"], ["faa_loadp", "op"], ["and_loadp", "op"], ["bts_loadp", "op"], ["cas_loadp", "op"], ["write_lock_loadp", "op"]],
+    labels= ["1 store N-1 load", "1 exch N-1 load", "1 and N-1 load", "1 bts N-1 load", "1 cas N-1 load", "1 write lock N-1 read lock"],
+    title="Throughput under load pressure (plotting the atomic op throughput)",
+    save="bench_data/plot_load_pressure_with_store.png" if save else None
+)
+
+simple_plot(
+    grouped,  
+    names = [["store_loadp", "load"], ["exchange_loadp", "load"], ["faa_loadp", "load"], ["and_loadp", "load"], ["bts_loadp", "load"], ["cas_loadp", "load"], ["write_lock_loadp", "load"]],
+    labels= ["N-1 load 1 store", "N-1 load 1 exch", "N-1 load 1 and", "N-1 load 1 bts", "N-1 load 1 cas", "N-1 read lock 1 write lock"],
+    title="Throughput under load pressure (plotting the load throughput)",
+    save="bench_data/plot_load_pressure_loads_with_store.png" if save else None
+)
+
+simple_plot(
+    grouped,  
+    names = [["exchange_loadp", "op"], ["faa_loadp", "op"], ["and_loadp", "op"], ["bts_loadp", "op"], ["cas_loadp", "op"], ["write_lock_loadp", "op"]],
+    labels= ["1 exch N-1 load", "1 and N-1 load", "1 bts N-1 load", "1 cas N-1 load", "1 write lock N-1 read lock"],
+    title="Throughput under load pressure (plotting the atomic op throughput)",
+    save="bench_data/plot_load_pressure.png" if save else None
+)
+
+simple_plot(
+    grouped,  
+    names = [["exchange_loadp", "load"], ["faa_loadp", "load"], ["and_loadp", "load"], ["bts_loadp", "load"], ["cas_loadp", "load"], ["write_lock_loadp", "load"]],
+    labels= ["N-1 load 1 exch", "N-1 load 1 and", "N-1 load 1 bts", "N-1 load 1 cas", "N-1 read lock 1 write lock"],
+    title="Throughput under load pressure (plotting the load throughput)",
+    save="bench_data/plot_load_pressure_loads.png" if save else None
+)
