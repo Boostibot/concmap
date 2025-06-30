@@ -248,13 +248,55 @@ records_atomic, errors_atomic = load_bench_result("bench_data/bench_atomic.csv")
 records_delay, errors_delay = load_bench_result("bench_data/bench_delay.csv")
 records_pressure, errors_pressure = load_bench_result("bench_data/bench_pressure.csv")
 
-redords = records_atomic + records_delay + records_pressure
-grouped = group_sum_bench_files(redords)
+distributed = []
+for i in range(7):
+    records_pressure, errors_pressure = load_bench_result(f"bench_data/bench_distributed{2**i}.csv")
+    distributed += records_pressure
+
+records = records_atomic + records_delay + records_pressure + distributed
+grouped = group_sum_bench_files(records)
 
 group_names = {bench_name:list(benchmark.keys()) for bench_name,benchmark in grouped.items()}
 print(group_names)
 
-save = True
+save = False
+
+distributed_names_faa_random = [f"distributed {2**i} faa random" for i in range(0, 7, 2)]
+distributed_names_faa_tid = [f"distributed {2**i} faa tid hash" for i in range(0, 7, 2)]
+distributed_names_read_random = [f"distributed {2**i} read random" for i in range(0, 7, 2)]
+distributed_names_read_tid = [f"distributed {2**i} read tid hash" for i in range(0, 7, 2)]
+distributed_names_read = [f"distributed {2**i} read" for i in range(0, 7, 2)]
+
+
+simple_plot(
+    grouped, 
+    names=["faa"] + distributed_names_read,
+    save="bench_data/distributed_faa_random.png" if save else None
+)
+
+simple_plot(
+    grouped, 
+    names=["faa"] + distributed_names_faa_tid,
+    save="bench_data/distributed_faa_random.png" if save else None
+)
+
+simple_plot(
+    grouped, 
+    names=["faa"] + distributed_names_faa_random,
+    save="bench_data/distributed_faa_random.png" if save else None
+)
+
+simple_plot(
+    grouped, 
+    names=["faa", "faa pause 1x", "faa pause 2x", "faa pause 4x", "faa pause 8x"],
+    save="bench_data/faa_pause_delay.png" if save else None
+)
+simple_plot(
+    grouped, 
+    names=["faa", "faa div 1x", "faa div 2x", "faa div 4x", "faa div 8x", "faa div 16x"],
+    save="bench_data/faa_div_delay.png" if save else None
+)
+
 simple_plot(
     grouped, 
     names= ["load", "store", "exchange", "faa", "and", "bts", "cas_all", "cas_success", "lock", "read_lock", "write_lock"],
@@ -265,7 +307,6 @@ simple_plot(
     names= ["faa", "exchange", "and", "bts", "cas_all", "cas_success", "lock", "read_lock", "write_lock"], 
     save="bench_data/ops_all.png" if save else None
 )
-simple_plot(grouped, ["cas_delay0", "cas_delay1", "cas_delay2", "cas_delay4"])
 
 simple_plot(
     grouped,  

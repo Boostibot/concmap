@@ -26,5 +26,14 @@
     <ClInclude Include="benchmarks.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="sharded.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="common.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="fine_locking.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

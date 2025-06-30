@@ -101,6 +101,17 @@ static inline void pause(uint64_t times) {
         pause_instruction();
 }
 
+void pause_with_divs(uint64_t times) {
+    volatile uint32_t a = 0x1ce4e5b9;
+    volatile uint32_t b = 0x133111eb;
+    
+    uint32_t bs = b;
+    uint32_t as = a;
+    for(uint64_t i = 0; i < times; i++)
+        as /= bs;
+        
+    a = as;
+}
 
 #include <vector>
 #include <condition_variable>
@@ -299,6 +310,7 @@ std::vector<std::vector<Bench_Result>> lunch_bench_threads(double seconds, size_
 
 struct Escape_Str {
     std::string_view view;
+    Escape_Str(std::string_view str) : view(str) {}
 };
 
 std::ostream& operator <<(std::ostream& stream, Escape_Str const& esc) {
@@ -316,7 +328,7 @@ void bench_raw_result_to_csv(std::ostream& stream, const char* benchmark_name, s
 {
     size_t trials = results_count ? results[0].size() : 0;
     for(size_t i = 0; i < results_count; i++) {
-        stream << Escape_Str{benchmark_name} << ", " << Escape_Str{thread_names[i]} << ", " << thread_indices[i] << ", " << thread_count << ", " << trials;
+        stream << Escape_Str(benchmark_name) << ", " << Escape_Str(thread_names[i]) << ", " << thread_indices[i] << ", " << thread_count << ", " << trials;
         for(size_t k = 0; k < trials; k++) {
             Bench_Result const& result = results[i][k];
             stream << ", " << result.iters << ", " << result.okays << ", " << result.duration_ns;
@@ -370,23 +382,18 @@ bool bench_process_and_output_csv(double time, size_t trials, size_t min_threads
             thread_names.push_back(func2_name);
     }
 
-    for(size_t i = min_threads; ; i += thread_incr) {
-        if(i >= max_threads)
-           i = max_threads; 
+    for(size_t threads = min_threads, i = 0; i < num_runs; threads += thread_incr, i++) {
+        if(threads >= max_threads)
+           threads = max_threads; 
      
-        num_runs += 1;
-        
-        printf("threads=%i\n", (int) i);
+        printf("threads=%i\n", (int) threads);
         std::vector<std::vector<Bench_Result>> raw;
         if(antisym == false)
-            raw = lunch_bench_threads<Fn1, decltype(dummy_bench_func)>(time_per_thread, (size_t) trials, func1, (size_t) i, dummy_bench_func, 0);
+            raw = lunch_bench_threads<Fn1, decltype(dummy_bench_func)>(time_per_thread, (size_t) trials, func1, (size_t) threads, dummy_bench_func, 0);
         else
-            raw = lunch_bench_threads<Fn1, Fn2>(time_per_thread, (size_t) trials, func1, 1, func2, i - 1);
+            raw = lunch_bench_threads<Fn1, Fn2>(time_per_thread, (size_t) trials, func1, 1, func2, threads - 1);
         
-        bench_raw_result_to_csv(file_raw, name, i, raw.data(), thread_names.data(), thread_indices.data(), i);
-
-        if(i >= max_threads)
-            break;
+        bench_raw_result_to_csv(file_raw, name, threads, raw.data(), thread_names.data(), thread_indices.data(), i + 1);
     }
 
     return file_raw.is_open();
@@ -440,6 +447,7 @@ static inline uint64_t random_splitmix64()
 	return z ^ (z >> 31);
 }
 
+template<size_t N>
 struct Distributed {
     enum {MAX = 64};
 
@@ -480,7 +488,7 @@ struct Distributed {
                 uint32_t val = data[i].val.load(std::memory_order_relaxed);
                 sum += val;
 
-                if(sum != history[i]) {
+                if(val != history[i]) {
                     history[i] = val;
                     all_same = false;
                 }
@@ -491,6 +499,39 @@ struct Distributed {
         }
     }
 };
+
+#include <stdarg.h>
+#include <stdio.h>
+std::string vfmt(const char* format, va_list args)
+{
+    std::string out;
+    if(format != NULL)
+    {
+        char local[1024];
+        va_list args_copy;
+        va_copy(args_copy, args);
+
+        int size = vsnprintf(local, sizeof local, format, args_copy);
+        out.resize(size);
+
+        if(size > sizeof local) 
+            vsnprintf(out.data(), size + 1, format, args);
+        else
+            memcpy(out.data(), local, size);
+    }
+
+    return out;
+}
+
+std::string fmt(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    std::string out = vfmt(format, args);
+    va_end(args);
+    return out;
+}
+
 void bench_all() {
     uint32_t non_atomic_target = 0;
     std::atomic<uint32_t> target = 0;
@@ -560,34 +601,6 @@ void bench_all() {
         *okay += 1;
     };
 
-    auto cas_delay0 = [&](uint64_t* okay, uint64_t* dummy){
-        uint32_t expected = 0;
-        target.compare_exchange_strong(expected, 1, std::memory_order_relaxed);
-        pause(0);
-        *okay += 1;
-    };
-
-    auto cas_delay1 = [&](uint64_t* okay, uint64_t* dummy){
-        uint32_t expected = 0;
-        target.compare_exchange_strong(expected, 1, std::memory_order_relaxed);
-        pause(1);
-        *okay += 1;
-    };
-    
-    auto cas_delay2 = [&](uint64_t* okay, uint64_t* dummy){
-        uint32_t expected = 0;
-        target.compare_exchange_strong(expected, 1, std::memory_order_relaxed);
-        pause(2);
-        *okay += 1;
-    };
-    
-    auto cas_delay4 = [&](uint64_t* okay, uint64_t* dummy){
-        uint32_t expected = 0;
-        target.compare_exchange_strong(expected, 1, std::memory_order_relaxed);
-        pause(4);
-        *okay += 1;
-    };
-
     double time = 4;
     size_t trials = 10;
     size_t min_threads = 1;
@@ -598,31 +611,129 @@ void bench_all() {
     const char* file_delay = "bench_delay.csv";
     const char* file_pressure = "bench_pressure.csv";
 
-    std::filesystem::remove(std::filesystem::path(folder) / file_atomic);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "load", load, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "store", store, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "exchange", exchange, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "faa", faa, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "and", _and, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "bts", bts, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "cas_all", cas, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "cas_success", load_cas, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "lock", lock, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "read_lock", read_lock, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "write_lock", write_lock, dummy_bench_func);
+    //std::filesystem::remove(std::filesystem::path(folder) / file_atomic);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "load", load, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "store", store, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "exchange", exchange, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "faa", faa, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "and", _and, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "bts", bts, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "cas_all", cas, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "cas_success", load_cas, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "lock", lock, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "read_lock", read_lock, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_atomic, "write_lock", write_lock, dummy_bench_func);
     
-    std::filesystem::remove(std::filesystem::path(folder) / file_delay);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "cas_delay0", cas_delay0, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "cas_delay1", cas_delay1, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "cas_delay2", cas_delay2, dummy_bench_func);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "cas_delay4", cas_delay4, dummy_bench_func);
+    auto faa_pause1 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause(1);
+        *okay += 1;
+    };
+    
+    auto faa_pause2 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause(2);
+        *okay += 1;
+    };
+    
+    auto faa_pause4 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause(4);
+        *okay += 1;
+    };
 
-    std::filesystem::remove(std::filesystem::path(folder) / file_pressure);
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "store_loadp", store, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "exchange_loadp", exchange, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "faa_loadp", faa, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "and_loadp", _and, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "bts_loadp", bts, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "cas_loadp", cas, load, true, "op", "load");
-    bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "write_lock_loadp", write_lock, read_lock, true, "op", "load");
+    auto faa_pause8 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause(8);
+        *okay += 1;
+    };
+    
+    auto faa_div1 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause_with_divs(1);
+        *okay += 1;
+    };
+
+    auto faa_div2 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause_with_divs(2);
+        *okay += 1;
+    };
+    
+    auto faa_div4 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause_with_divs(4);
+        *okay += 1;
+    };
+    
+    auto faa_div8 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause_with_divs(8);
+        *okay += 1;
+    };
+    
+    auto faa_div16 = [&](uint64_t* okay, uint64_t* dummy){
+        target.fetch_add(1, std::memory_order_relaxed);
+        pause_with_divs(16);
+        *okay += 1;
+    };
+    
+    //std::filesystem::remove(std::filesystem::path(folder) / file_delay);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa pause 1x", faa_pause1, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa pause 2x", faa_pause2, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa pause 4x", faa_pause4, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa pause 8x", faa_pause4, dummy_bench_func);
+    //
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa div 1x", faa_div1, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa div 2x", faa_div2, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa div 4x", faa_div4, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa div 8x", faa_div8, dummy_bench_func);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_delay, "faa div 16x", faa_div8, dummy_bench_func);
+
+    //std::filesystem::remove(std::filesystem::path(folder) / file_pressure);
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "store_loadp", store, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "exchange_loadp", exchange, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "faa_loadp", faa, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "and_loadp", _and, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "bts_loadp", bts, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "cas_loadp", cas, load, true, "op", "load");
+    //bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file_pressure, "write_lock_loadp", write_lock, read_lock, true, "op", "load");
+    
+    for(int i = 0; i <= 6; i += 2) {
+        int size = 1 << i;
+        Distributed d(size);
+        auto distributed_faa_random = [&](uint64_t* okay, uint64_t* dummy){
+            d.add(1, random_splitmix64());
+            *okay += 1;
+        };
+
+        auto distributed_faa_tid = [&](uint64_t* okay, uint64_t* dummy){
+            d.add(1, hash32(artificial_thread_id()));
+            *okay += 1;
+        };
+        
+        auto distributed_read_random = [&](uint64_t* okay, uint64_t* dummy){
+            *dummy = d.load_at(random_splitmix64());
+            *okay += 1;
+        };
+
+        auto distributed_read_tid = [&](uint64_t* okay, uint64_t* dummy){
+            *dummy = d.load_at(hash32(artificial_thread_id()));
+            *okay += 1;
+        };
+
+        auto distributed_read = [&](uint64_t* okay, uint64_t* dummy){
+            *dummy = d.load();
+            *okay += 1;
+        };
+
+        std::string file_distributed = fmt("bench_distributed%i.csv", size);
+        const char* file = file_distributed.data();
+        std::filesystem::remove(std::filesystem::path(folder) / file);
+        bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file, fmt("distributed %i faa random", size).data(), distributed_faa_random, dummy_bench_func);
+        bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file, fmt("distributed %i faa tid hash", size).data(), distributed_faa_tid, dummy_bench_func);
+        bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file, fmt("distributed %i read", size).data(), distributed_read, dummy_bench_func);
+        bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file, fmt("distributed %i read random", size).data(), distributed_read_random, dummy_bench_func);
+        bench_process_and_output_csv(time, trials, min_threads, max_threads, incr_threads, folder, file, fmt("distributed %i read tid hash", size).data(), distributed_read_tid, dummy_bench_func);
+    }
 }

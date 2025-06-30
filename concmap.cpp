@@ -1,6 +1,4 @@
 
-
-#if 0
 #include <stdint.h>
 #include <string.h>
 
@@ -10,88 +8,6 @@
     #define ASSERT(x) assert(x)
     #define TEST(x) assert(x)
 #endif
-
-#define XXHASH_FN64_PRIME_1  0x9E3779B185EBCA87ULL
-#define XXHASH_FN64_PRIME_2  0xC2B2AE3D27D4EB4FULL
-#define XXHASH_FN64_PRIME_3  0x165667B19E3779F9ULL
-#define XXHASH_FN64_PRIME_4  0x85EBCA77C2B2AE63ULL
-#define XXHASH_FN64_PRIME_5  0x27D4EB2F165667C5ULL
-
-static inline uint64_t _xxhash64_rotate_left(uint64_t x, uint8_t bits)
-{
-    return (x << bits) | (x >> (64 - bits));
-}
-
-static inline uint64_t _xxhash64_process_single(uint64_t previous, uint64_t input)
-{
-    return _xxhash64_rotate_left(previous + input * XXHASH_FN64_PRIME_2, 31) * XXHASH_FN64_PRIME_1;
-}
-
-static uint64_t xxhash64(const void* key, int64_t size, uint64_t seed)
-{
-    uint32_t endian_check = 0x33221100;
-    REQUIRE(*(uint8_t*) (void*) &endian_check == 0 && "Big endian machine detected! Please change this algorithm to suite your machine!");
-    REQUIRE((key != NULL || size == 0) && size >= 0);
-
-    uint8_t* data = (uint8_t*) (void*) key;
-    uint8_t* end = data + size;
-    
-    //Bulk computation
-    uint64_t hash = seed + XXHASH_FN64_PRIME_5;
-    if (size >= 32)
-    {
-        uint64_t state[4] = {0};
-        uint64_t block[4] = {0};
-        state[0] = seed + XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_2;
-        state[1] = seed + XXHASH_FN64_PRIME_2;
-        state[2] = seed;
-        state[3] = seed - XXHASH_FN64_PRIME_1;
-        
-        for(; data < end - 31; data += 32)
-        {
-            memcpy(block, data, 32);
-            state[0] = _xxhash64_process_single(state[0], block[0]);
-            state[1] = _xxhash64_process_single(state[1], block[1]);
-            state[2] = _xxhash64_process_single(state[2], block[2]);
-            state[3] = _xxhash64_process_single(state[3], block[3]);
-        }
-
-        hash = _xxhash64_rotate_left(state[0], 1)
-            + _xxhash64_rotate_left(state[1], 7)
-            + _xxhash64_rotate_left(state[2], 12)
-            + _xxhash64_rotate_left(state[3], 18);
-        hash = (hash ^ _xxhash64_process_single(0, state[0])) * XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_4;
-        hash = (hash ^ _xxhash64_process_single(0, state[1])) * XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_4;
-        hash = (hash ^ _xxhash64_process_single(0, state[2])) * XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_4;
-        hash = (hash ^ _xxhash64_process_single(0, state[3])) * XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_4;
-    }
-    hash += (uint64_t) size;
-
-    //Consume last <32 Bytes
-    for (; data + 8 <= end; data += 8)
-    {
-        uint64_t read = 0; memcpy(&read, data, sizeof read);
-        hash = _xxhash64_rotate_left(hash ^ _xxhash64_process_single(0, read), 27) * XXHASH_FN64_PRIME_1 + XXHASH_FN64_PRIME_4;
-    }
-
-    if (data + 4 <= end)
-    {
-        uint32_t read = 0; memcpy(&read, data, sizeof read);
-        hash = _xxhash64_rotate_left(hash ^ read * XXHASH_FN64_PRIME_1, 23) * XXHASH_FN64_PRIME_2 + XXHASH_FN64_PRIME_3;
-        data += 4;
-    }
-
-    while (data < end)
-        hash = _xxhash64_rotate_left(hash ^ (*data++) * XXHASH_FN64_PRIME_5, 11) * XXHASH_FN64_PRIME_1;
-        
-    // Avalanche
-    hash ^= hash >> 33;
-    hash *= XXHASH_FN64_PRIME_2;
-    hash ^= hash >> 29;
-    hash *= XXHASH_FN64_PRIME_3;
-    hash ^= hash >> 32;
-    return hash;
-}
 
 #include <chrono>
 static uint64_t clock_ns()
@@ -626,10 +542,6 @@ struct Distributed_Map {
     }
 };
 
-inline static uint32_t current_thread_id() {
-    return (uint32_t) std::hash<std::thread::id>{}(std::this_thread::get_id());
-}
-
 template <typename T, size_t N>
 struct Small_Array {
     T* data;
@@ -742,6 +654,338 @@ struct Gen_Ptr {
     
     T* get() const {
         return decode(val).ptr;
+    }
+};
+
+struct alignas(std::hardware_destructive_interference_size) Distrint {
+    std::atomic<uint64_t> gen_val;
+};
+
+void distrint_add(Distrint* distributed, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
+    
+    assert((N & (N - 1)) == 0, "must be power of two!");
+    uint32_t i = at & (N - 1);
+
+    //add (1, val) to (gen, stored)
+    uint64_t added = 1ull << value_bits | val;
+    distributed[i].gen_val.fetch_add(added);
+}
+
+void distrint_sub(Distrint* distributed, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
+    
+    assert((N & (N - 1)) == 0, "must be power of two!");
+    uint32_t i = at & (N - 1);
+    uint64_t gen_mask = (uint64_t) -1 << value_bits;
+    
+    //add (0, -val) to (gen, stored)
+    //where -val is the complement. This complement causes
+    //overflow in stored which in turn ticks up gen counter
+    uint64_t added = (-val) & ~gen_mask;
+    distributed[i].gen_val.fetch_add(added);
+}
+
+uint64_t distrint_get(Distrint* distributed, uint32_t N, uint32_t value_bits) 
+{
+    uint64_t gen_mask = (uint64_t) -1 << value_bits;
+    if(N == 1)
+        return distributed[0].gen_val & ~gen_mask;
+
+    enum {MAX = 64};
+    assert((N & (N - 1)) == 0, "must be power of two!");
+    assert(N < MAX);
+
+    uint64_t history[MAX]; (void) history; //not initialized
+    for(uint32_t i = 0; i < N; i++) 
+        history[i] = distributed[i].gen_val.load(std::memory_order_relaxed);
+        
+    for(uint32_t repeat = 0;; repeat++) {
+        uint64_t sum = 0;
+
+        bool all_same = true;
+        for(uint32_t i = 0; i < N; i++) {
+            uint64_t val = distributed[i].gen_val.load(std::memory_order_relaxed);
+            sum += val;
+
+            if(val != history[i]) {
+                history[i] = val;
+                all_same = false;
+            }
+        }
+
+        if(all_same) {
+            return sum & ~gen_mask;
+        }
+    }
+}
+
+template <uint32_t N, uint32_t value_bits = 32>
+struct Distributed_Int {
+    Distrint distributed[N];
+
+    void add(uint64_t val, uint32_t at) { distrint_add(distributed, N, val, at, value_bits); }
+    void sub(uint64_t val, uint32_t at) { distrint_sub(distributed, N, val, at, value_bits); }
+    uint64_t get() const                { distrint_get(distributed, N, value_bits); }
+};
+
+template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
+struct Fine_Lock_Map 
+{
+    enum {MIN_CAPACITY = 64};
+
+    struct Node {
+        std::atomic<Node*> next;
+        uint64_t hash;
+        Key key;
+        Value value;
+    };
+    
+    struct Slot {
+        std::shared_mutex mutex;
+        std::atomic<Node*> first;
+    };
+
+    struct Table {
+        uint64_t capacity;
+        std::atomic<uint32_t> count; //can be distributed eventually
+        std::atomic<uint32_t> migrated;
+
+        alignas(std::hardware_destructive_interference_size)
+        Slot slots[];
+    };
+
+    mutable std::atomic<uint32_t> head_tail_index;
+    mutable std::atomic<Table*> tables[32];
+
+    Fine_Lock_Map(uint32_t initial_capacity = MIN_CAPACITY) {
+        
+    }
+
+    void migrate(uint32_t head, uint32_t tail, uint32_t max_times = 3) const
+    {
+        //attempt to migrate all entries from a single slot.
+        //If the given slot is empty tries up to max_times.
+        Table* head_table = tables[head].load(std::memory_order_relaxed);
+        Table* tail_table = tables[tail].load(std::memory_order_relaxed);
+        for(uint32_t rep = 0; rep < max_times; rep) {
+            uint64_t migrated = head_table->migrated.fetch_add(1);
+            uint64_t capacity = 1ull << i;
+            Slot* slot = &table->slots[migrated];
+
+            //if we have already migrated everything quit
+            if(migrated >= capacity) 
+                return;
+
+            //double locking of the migrated bucket
+            Node* first = table[migrated].first.load(std::memory_order_relaxed);
+            if(first == NULL)
+                continue;
+            
+            //attempt to migrate all entries
+            {
+                std::shared_lock lock(table[migrated].mutex);
+                first = table[migrated].first.load(std::memory_order_relaxed);
+                for(Node* curr = first; curr != NULL; ) {
+                    Node* next = curr->next.load(std::memory_order_relaxed);
+                
+                    //transplant node into the newer table. 
+                    //If is not found there, inserts it
+                    // else we simply delete it
+                    bool found = set_or_transplant_into_table(tail_table, curr->key, curr->hash, NULL, curr);
+                    if(found == false)
+                        delete curr;
+                    curr = next;
+                }
+                table[migrated].first.store(NULL, std::memory_order_relaxed);
+            }
+
+            //If was the last one bump up the head table
+            if(i == capacity - 1) {
+                uint32_t curr_head_tail = head_tail_index.fetch_add(1 << 16);
+                uint32_t curr_head = curr_head_tail >> 16;
+                uint32_t curr_tail = curr_head_tail & 0xFFFF;
+                ASSERT(curr_head == head);
+                ASSERT(curr_tail >= tail);
+            }
+
+            break;
+        }
+    }
+
+    bool set_or_transplant_into_table(Table* table, uint32_t table_i, Key const& key, uint64_t hash, Value* value, Node* old_node) {
+        uint64_t capacity = 1ull << i;
+        uint64_t i = hash & (capacity - 1);
+        Slot* slot = &table->slots[i];
+
+        slot->mutex.lock();
+        Node* first = slot->first.load(std::memory_order_relaxed);
+        for(Node* curr = first; curr != NULL; curr = curr->next.load(std::memory_order_relaxed)) {
+            if(curr->hash == hash && equals(curr->key, key)) {
+                if(old_node == NULL)
+                    curr->value = std::move(*value);
+
+                slot->mutex.unlock();
+                return true;
+            }
+        }
+
+        Node* new_node = old_node ? old_node : new Node(first, hash, key, std::move(value));
+        slot->first.store(new_node, std::memory_order_relaxed);
+        slot->mutex.unlock();
+
+        //increase the count and if too much allocate a new bigger table
+        uint32_t count = table->count.fetch_add(1);
+        if(count > capacity*3/4) 
+            try_create_new_table(table_i);
+
+        return false;
+    }
+    
+    bool try_create_new_table(uint32_t table_i) {
+        ASSERT(table_i <= 31);
+
+        //check once again if nobody has allocate a bigger table (just in case)
+        uint32_t curr_head_tail = head_tail_index.load();
+        uint32_t curr_tail = curr_head_tail & 0xFFFF;
+        if(table_i == curr_tail && tables[table_i + 1].load() == NULL) {
+
+            //allocate the bigger table and try to claim a spot
+            uint64_t capacity = table_i*2;
+            Table* new_table = malloc(sizeof(Table) + capacity*sizeof(Slot));
+            Table* null_table = NULL;
+            if(tables[new_tail + 1].compare_exchange_strong(null_table, new_table)) {
+                    
+                //properly initialize the new table
+                new_table->count = 0;
+                new_table->migrated = 0;
+                for(uint32_t k = 0; k < new_table; k++)
+                    new (new_table->slots + k) Slot();
+
+                //publish it
+                uint32_t new_head_tail = head_tail_index.fetch_add(1);
+                uint32_t new_tail = new_head_tail & 0xFFFF;
+                ASSERT(new_tail == curr_tail);
+                return true;
+            }
+            else {
+                free(new_table);
+            }
+        }
+        return false;
+    }
+
+    void set(Key const& key, uint64_t hash, Value value) {
+        uint32_t head_tail = head_tail_index.load(std::memory_order_relaxed);
+        uint32_t head = head_tail >> 16;
+        uint32_t tail = head_tail & 0xFFFF;
+
+        Table* table = tables[tail].load(std::memory_order_relaxed);
+        set_or_transplant_into_table(table, key, hash, &value, NULL);
+        
+        if(head != tail)
+            migrate(head, tail);
+    }
+
+    bool get(Key const& key, uint64_t hash, Value* out) const {
+        uint64_t head_tail = head_tail_index.load();
+        uint32_t head = head_tail >> 16;
+        uint32_t tail = head_tail & 0xFFFF;
+        
+        //go thorugh the tables newest to oldest
+        // and look for a single entry matching key. 
+        //Each table can in theory contain a different entry with the same key
+        // so we just return the newest. Restart if newest table has changed
+        // (yes we have to restart the whole thing since it could happen
+        // that an entry was migrated just in between us switching tables thus
+        // it was there yet we didnt register it)
+        for(uint32_t rep = 0; ; rep++) {
+
+            for(uint32_t table_i = tail; table_i >= head; table_i--) {
+                Slot* table = tables[table_i].load();
+                uint64_t i = hash & (table->capacity - 1);
+                    
+                //double locking
+                Node* first = table[i].first.load(std::memory_order_relaxed);
+                if(first == NULL)
+                    continue;
+
+                std::shared_lock lock(table[i].mutex);
+                first = table[i].first.load(std::memory_order_relaxed);
+                for(Node* curr = first; curr != NULL; curr = curr->next.load(std::memory_order_relaxed)) {
+                    if(curr->hash == hash && equals(curr->key, key)) {
+                        if(out)
+                            *out = curr->value;
+                    
+                        if(head != tail)
+                            migrate(head, tail);
+                        return true;
+                    }
+                }
+            }
+        
+            uint64_t new_head_tail = head_tail_index.load();
+            uint32_t new_head = new_head_tail >> 16;
+            uint32_t new_tail = new_head_tail & 0xFFFF;
+            if(tail == new_tail)
+                break;
+
+            tail = new_tail;
+            head = new_head;
+        }
+
+        if(head != tail)
+            migrate(head, tail);
+        return false;
+    }
+
+    bool remove(Key const& key, uint64_t hash, Value* out) {
+        bool found = false;
+        
+        uint64_t head_tail = head_tail_index.load(std::memory_order_relaxed);
+        uint32_t head = head_tail >> 16;
+        uint32_t tail = head_tail & 0xFFFF;
+        
+        //go thorugh the tables oldest to newest
+        // and delete all entries with the given key. Reload the tail
+        // after each iter so that we end on really the newest table
+        for(uint32_t table_i = head; table_i <= tail; table_i++) {
+            Slot* table = tables[table_i].load();
+            uint64_t i = hash & (table->capacity - 1);
+                    
+            //double locking
+            Node* first = table[i].first.load(std::memory_order_relaxed);
+            if(first != NULL)
+            {
+                std::unique_lock lock(table[i].mutex);
+                first = table[i].first.load(std::memory_order_relaxed);
+            
+                //find node and dele from chain
+                std::atomic<Node*>* prev = &table[i].first;
+                for(Node* curr = first; curr != NULL;) {
+                    Node* next = curr->next.load(std::memory_order_relaxed);
+                    if(curr->hash == hash && equals(curr->key, key)) {
+                        prev->store(next, std::memory_order_relaxed);
+                        found = true;
+                        if(out)
+                            *out = std::move(curr->value);
+
+                        delete curr;
+                        break;
+                    }
+
+                    prev = &curr->next;
+                    curr = next;
+                }
+            }
+                
+            head_tail = head_tail_index.load(std::memory_order_relaxed);
+            head = head_tail >> 16;
+            tail = head_tail & 0xFFFF;
+        }
+            
+        if(head != tail)
+            migrate(head, tail);
+
+        return found;
     }
 };
 
