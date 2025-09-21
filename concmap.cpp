@@ -593,7 +593,7 @@ struct Gen_Ptr {
     static constexpr uint64_t MULT = ((uint64_t) 1 << 48) / alignof(T);
     static constexpr uint64_t MAX_GEN = ((uint64_t) 1 << 16) * alignof(T);
     
-    struct Decompressed {
+    struct Value {
         T* ptr;
         uint64_t gen;
         uint64_t val;
@@ -603,7 +603,7 @@ struct Gen_Ptr {
         }
     };
 
-    static Decompressed decode(uint64_t val) {
+    static Value decode(uint64_t val) {
         uint64_t mult = ((uint64_t) 1 << 48) / alignof(T);
         uint64_t gen = val / mult;
         uint64_t ptr_num = val % mult;
@@ -615,7 +615,7 @@ struct Gen_Ptr {
         int dummy = 0; dummy = dummy + 0;
 
         ptr |= ((uint64_t) &dummy) & ((uint64_t) (-1) << 48);
-        return Decompressed{(T*) ptr, gen, val};
+        return Value{(T*) ptr, gen, val};
     }
 
     static uint64_t encode(T* ptr, uint64_t gen) {
@@ -631,7 +631,7 @@ struct Gen_Ptr {
         return val + mult;
     }
 
-    Decompressed decode() const {
+    Value decode() const {
         return decode(val);
     }
     
@@ -642,13 +642,13 @@ struct Gen_Ptr {
     
     bool cas(uint64_t old_val, T* ptr) {
         //uint64_t old_val = val.load(std::memory_order_relaxed);
-        Decompressed decoded = decode();
+        Value decoded = decode();
         uint64_t new_val = encode(ptr, decoded.gen + 1);
         return val.compare_exchange_strong(old_val, new_val);
     }
 
     void set(T* ptr) {
-        Decompressed decoded = decode(val.load(std::memory_order_relaxed));
+        Value decoded = decode(val.load(std::memory_order_relaxed));
         val = encode(ptr, decoded.gen + 1);
     }
     
@@ -657,21 +657,52 @@ struct Gen_Ptr {
     }
 };
 
-struct alignas(std::hardware_destructive_interference_size) Distrint {
-    std::atomic<uint64_t> gen_val;
-};
+template <typename T>
+void atomic_stack_push(Gen_Ptr<T>* head, T* first, T* last)
+{
+    for(;;) {
+        auto head_d = head.decode();
+        uint64_t new_val = encode(first, head_d.gen + 1);
+        last->next.val = head->val;
+        
+        if(head->val.compare_exchange_strong(head_d.val, new_val))
+            break;
+    }
+}
 
-void distrint_add(Distrint* distributed, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
+template <typename T>
+T* atomic_stack_pop(Gen_Ptr<T>* head)
+{
+    for(;;) {
+        auto head_d = head.decode();
+        if(head_d.ptr == NULL)
+            return NULL;
+
+        uint64_t new_val = encode(head_d.ptr->next, head_d.gen + 1);
+        uint64_t new_val = encode(first, head_d.gen + 1);
+        last->next.val = head->val;
+
+        if(head->val.compare_exchange_strong(old_val, new_val))
+            break;
+    }
+}
+
+std::atomic<uint64_t>* distrint_at(std::atomic<uint64_t>* distributed, size_t stride, uint32_t i)
+{
+    return (std::atomic<uint64_t>*) (void*) ((uint8_t*) (void*) distributed + stride);
+}
+
+void distrint_add(std::atomic<uint64_t>* distributed, size_t stride, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
     
     assert((N & (N - 1)) == 0, "must be power of two!");
     uint32_t i = at & (N - 1);
 
     //add (1, val) to (gen, stored)
     uint64_t added = 1ull << value_bits | val;
-    distributed[i].gen_val.fetch_add(added);
+    distrint_at(distributed, stride, i)->fetch_add(added);
 }
 
-void distrint_sub(Distrint* distributed, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
+void distrint_sub(std::atomic<uint64_t>* distributed, size_t stride, uint32_t N, uint64_t val, uint32_t at, uint32_t value_bits) {
     
     assert((N & (N - 1)) == 0, "must be power of two!");
     uint32_t i = at & (N - 1);
@@ -681,14 +712,14 @@ void distrint_sub(Distrint* distributed, uint32_t N, uint64_t val, uint32_t at, 
     //where -val is the complement. This complement causes
     //overflow in stored which in turn ticks up gen counter
     uint64_t added = (-val) & ~gen_mask;
-    distributed[i].gen_val.fetch_add(added);
+    distrint_at(distributed, stride, i)->fetch_add(added);
 }
 
-uint64_t distrint_get(Distrint* distributed, uint32_t N, uint32_t value_bits) 
+uint64_t distrint_get(std::atomic<uint64_t>* distributed, size_t stride, uint32_t N, uint32_t value_bits) 
 {
     uint64_t gen_mask = (uint64_t) -1 << value_bits;
     if(N == 1)
-        return distributed[0].gen_val & ~gen_mask;
+        return distrint_at(distributed, stride, 0)->load() & ~gen_mask;
 
     enum {MAX = 64};
     assert((N & (N - 1)) == 0, "must be power of two!");
@@ -696,14 +727,14 @@ uint64_t distrint_get(Distrint* distributed, uint32_t N, uint32_t value_bits)
 
     uint64_t history[MAX]; (void) history; //not initialized
     for(uint32_t i = 0; i < N; i++) 
-        history[i] = distributed[i].gen_val.load(std::memory_order_relaxed);
+        history[i] = distrint_at(distributed, stride, i)->load(std::memory_order_relaxed);
         
     for(uint32_t repeat = 0;; repeat++) {
         uint64_t sum = 0;
 
         bool all_same = true;
         for(uint32_t i = 0; i < N; i++) {
-            uint64_t val = distributed[i].gen_val.load(std::memory_order_relaxed);
+            uint64_t val = distrint_at(distributed, stride, i)->load(std::memory_order_relaxed);
             sum += val;
 
             if(val != history[i]) {
@@ -719,12 +750,16 @@ uint64_t distrint_get(Distrint* distributed, uint32_t N, uint32_t value_bits)
 }
 
 template <uint32_t N, uint32_t value_bits = 32>
-struct Distributed_Int {
-    Distrint distributed[N];
+struct Distrint {
+    struct alignas(std::hardware_destructive_interference_size) Single {
+        std::atomic<uint64_t> val;
+    };
 
-    void add(uint64_t val, uint32_t at) { distrint_add(distributed, N, val, at, value_bits); }
-    void sub(uint64_t val, uint32_t at) { distrint_sub(distributed, N, val, at, value_bits); }
-    uint64_t get() const                { distrint_get(distributed, N, value_bits); }
+    Single distributed[N];
+
+    void add(uint64_t val, uint32_t at) { distrint_add(distributed->val, sizeof(Single), N, val, at, value_bits); }
+    void sub(uint64_t val, uint32_t at) { distrint_sub(distributed->val, sizeof(Single), N, val, at, value_bits); }
+    uint64_t get() const                { distrint_get(distributed->val, sizeof(Single), N, value_bits); }
 };
 
 template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
@@ -989,16 +1024,13 @@ struct Fine_Lock_Map
     }
 };
 
-//#include "spmc_queue.h"
-
-struct EBR_OLD {
+struct EBR_Simple {
     struct alignas(std::hardware_destructive_interference_size) Slot {
         std::atomic<uint64_t> gen_and_taken;
         std::atomic<uint64_t> thread_id;
 
         //more or less arbitrary per "thread" payload
         std::atomic<uint64_t> hash;
-
     };
 
     struct Instance {
@@ -1009,7 +1041,7 @@ struct EBR_OLD {
     
     std::atomic<Instance*> instance;
 
-    EBR_OLD(size_t initial_capacity = 16) {
+    EBR_Simple(size_t initial_capacity = 16) {
         if(initial_capacity <= 0)
            initial_capacity = 1; 
 
@@ -1018,7 +1050,7 @@ struct EBR_OLD {
         instance = make_instance(NULL, (uint64_t) initial_capacity);
     }
 
-    ~EBR_OLD() {
+    ~EBR_Simple() {
         Instance* first = this->instance.load();
         for(Instance* curr = first; curr != NULL; )
         {
@@ -1104,10 +1136,10 @@ struct EBR_OLD {
     }
     
     struct Lock {
-        EBR_OLD* ebr;
+        EBR_Simple* ebr;
         Slot* slot;
 
-        Lock(EBR_OLD& ebr, uint64_t hash, uint32_t thread_id) {
+        Lock(EBR_Simple& ebr, uint64_t hash, uint32_t thread_id) {
             this->ebr = &ebr;
             this->slot = ebr.lock(hash, thread_id);
         }
@@ -1118,13 +1150,62 @@ struct EBR_OLD {
     };
 };
 
+#ifdef _MSC_VER
+    #include "intrin.h"
+    static inline bool atomic_bit_test_and_set(std::atomic<uint32_t>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        (void) order;
+        return _interlockedbittestandset((long*) (void*) val, offset);
+    }
+
+    static inline bool atomic_bit_test_and_reset(std::atomic<uint32_t>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        (void) order;
+        return _interlockedbittestandreset((long*) (void*) val, offset);
+    }
+    
+    static inline bool atomic_bit_test_and_set(std::atomic<uint64_t>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        (void) order;
+        return _interlockedbittestandset64((__int64*) (void*) val, offset);
+    }
+
+    static inline bool atomic_bit_test_and_reset(std::atomic<uint64_t>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        (void) order;
+        return _interlockedbittestandreset64((__int64*) (void*) val, offset);
+    }
+
+    static inline int64_t ebr_rdtsc()
+    {
+        return __rdtsc();
+
+    }
+#elif defined(__GNUC__) || defined(__clang__) 
+    template <typename T>
+    static inline bool atomic_bit_test_and_set(std::atomic<T>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        T val = (T) 1 << bit;
+        return (a->fetch_or(val, order) & val) != 0;
+    }
+
+    template <typename T>
+    static inline bool atomic_bit_test_and_reset(std::atomic<T>* val, uint32_t offset, std::memory_order order = std::memory_order_seq_cst)
+    {
+        T val = (T) 1 << bit;
+        return (a->fetch_and(~val, order) & val) != 0;
+    }
+#else
+    #error bad compiler
+#endif
+
 struct EBR {
     static constexpr uint32_t EMPTY_THREAD_ID = 0;
     typedef void* (*Create_Node_Func)(void* context);
     typedef void (*Publish_Node_Func)(void* node, void* context);
     typedef void (*Delete_Node_Func)(void* node, void* context);
     
-    struct EBR_Config {
+    struct Config {
         size_t node_ebr_offset = 0;
         Create_Node_Func create_node_func = NULL;
         Publish_Node_Func publish_node_func = NULL; //optional. Gets called after a node was sucessfully published in a single ebr instance
@@ -1133,7 +1214,13 @@ struct EBR {
         double collect_every_s = 0.016; //16ms = one frame
     };
     
-    struct EBR_Node_Data {
+    enum Node_State {
+        EMPTY   = 0b00,
+        LOCKING = 0b01,
+        LOCKED  = 0b11,
+    };
+
+    struct Node_Data {
         std::atomic<uint64_t> gen_and_taken;
         std::atomic<uint64_t> last_access_clock_ns;
         std::atomic<uint32_t> thread_id;
@@ -1141,7 +1228,7 @@ struct EBR {
 
     struct Slot {
         std::atomic<uint32_t> id;
-        std::atomic<EBR_Node_Data*> data;
+        std::atomic<Node_Data*> data;
     };
 
     struct Instance {
@@ -1166,28 +1253,34 @@ struct EBR {
         }
     }
 
-    void node_state(EBR_Config const& config, void* user_data) {
-        EBR_Node_Data* data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+    template <typename T, size_t N, typename Func>
+    void gather_thread_state_table(Config const& config, Small_Array<T, N>* into, Func const& load_func) 
+    {
+        Instance* instance = this->instance.load();
+        into->resize(instance->capacity);
+        uint64_t used_up = 0;
+        for(uint64_t i = 0; i < instance->capacity; i++) {
+            Slot* slot = &instance->slots[i];
+            Node_Data* data = slot->data.load(std::memory_order_relaxed);
+            void* user_data = (uint8_t*) data - config.node_ebr_offset;
 
-        uint32_t thread_id = 0;
-        uint64_t last_access = 0;
-
-        uint64_t gen0 = data->gen_and_taken.load(std::memory_order_acquire);
-        while(true) {
-            thread_id = data->thread_id.load(std::memory_order_relaxed);
-            last_access = data->last_access_clock_ns.load(std::memory_order_relaxed);
-            uint64_t gen1 = data->gen_and_taken.load(std::memory_order_acquire);
-
-            if(gen0 == gen1)
-                break;
-            
-            gen0 = gen1;
+            if(data) {
+                uint64_t gen0 = data->gen_and_taken.load(std::memory_order_acquire);
+                while(gen0 % 4 == LOCKED) {
+                    load_func(&into->data[used_up], user_data, gen0);
+                    uint64_t gen1 = data->gen_and_taken.load(std::memory_order_acquire);
+                    if(gen0 == gen1) {
+                        used_up += 1;
+                        break;
+                    }
+                    
+                    gen0 = gen1;
+                }
+            }
         }
+    } 
 
-        
-    }
-
-    void* lock(EBR_Config const& config, uint32_t thread_id = current_thread_id()) {
+    void* locking_begin(Config const& config, uint32_t thread_id, Node_Data** node_data) {
         for(uint64_t retry = 0; ; retry++) {
             Instance* instance = this->instance.load();
             ASSERT(instance);
@@ -1197,48 +1290,34 @@ struct EBR {
             for(uint64_t iter = 0; iter <= mask; iter++, i = (i + iter) & mask) {
                 Slot* slot = &instance->slots[i];
                 
+                //We can use relaxed load on id and have data always be non null
+                // since its immutable and we synchronized through the instance load
+                Node_Data* data = slot->data.load(std::memory_order_relaxed);
                 uint32_t id = slot->id.load(std::memory_order_relaxed);
                 if(id == thread_id) {
-                    //slot->id => slot->data and we can use relaxed since
-                    // if slot->id == thread_id we were the thread that did 
-                    // the storing so that relaxed loads are ordered (from our POV).
-                    //
-                    //BUT! someone else could have overriden this slot thus we dont have to
-                    // be the thread that originally created it. Thats fine though since
-                    // data is immutable, thus it will always be there.
-                    EBR_Node_Data* data = slot->data.load(std::memory_order_relaxed);
-                    ASSERT(data);
-                    
                     //Even though we are the rightful owners, in the time between 
                     // the slot->id == thread_id and here, we could have been scheduled out.
                     //Thus it is entirely possible for this threads slot to be in in the meantime replaced
                     // by some other thread. We need to ensure that only one thread is doing the storing
-                    // of the data to ensure integrity. Thus we CAS fight over the taken flag
-                    uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
-                    if(gen_and_taken % 4 == 0)
-                        if(data->gen_and_taken.compare_exchange_strong(gen_and_taken, gen_and_taken + 1, 
-                            std::memory_order_acquire, std::memory_order_relaxed
-                        )) {
-                            printf("TID %08llx found itself in slot #%lli\n", (long long) thread_id, (long long) i);
-                            data->last_access_clock_ns.store(clock_ns(), std::memory_order_relaxed);
+                    // of the data to ensure integrity. Thus we BTS fight over the taken flag to set it to LOCKING
+                    if(atomic_bit_test_and_set(&data->gen_and_taken, 0, std::memory_order_relaxed) == false) {
+
+                        //TODO: get rid of this and just store while claiming. We will get eviceted every 
+                        //couple of seconds but it doesnt matter. The cost is less than getting a clock each time.
+                        data->last_access_clock_ns.store(clock_ns(), std::memory_order_relaxed); //TODO: just rdtsc
+                        
+                        #ifdef EBR_TESTING
                             data->thread_id.store(thread_id, std::memory_order_relaxed);
+                            printf("TID %08llx found itself in slot #%lli\n", (long long) thread_id, (long long) i);
+                        #endif
+                        
+                        *node_data = data;
 
-                            //if accidentally stole this slot then repair it
-                            // (can happen when slot->id == thread_id succeeds, then we go to sleep,
-                            // another thread replaces us, does full lock + unlock sequence, then we wake
-                            // up and also successfully CAS gen_and_taken, yet by this point the thread id
-                            // differs).
-                            if(slot->id.load(std::memory_order_relaxed) != thread_id)
-                                slot->id.store(thread_id, std::memory_order_relaxed);
-
-
-                            //mark as full
-                            data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_release);
-                            printf("TID %08llx locked in slot #%lli\n", (long long) thread_id, (long long) i);
-
-                            void* user_data = (uint8_t*) data - config.node_ebr_offset;
-                            return user_data;
-                        }
+                        void* user_data = (uint8_t*) data - config.node_ebr_offset;
+                        return user_data;
+                        //TODO: we can easily turn EBR into 0 contention RW lock.
+                        return data;
+                    }
                 }
             }
             
@@ -1261,12 +1340,13 @@ struct EBR {
                 Slot* slot = &instance->slots[i];
 
                 uint32_t id = slot->id.load();
-                EBR_Node_Data* data = slot->data.load();
+                Node_Data* data = slot->data.load();
+                
+                //If not there try to allocate a new node
                 if(data == NULL) {
-
                     void* user_data = config.create_node_func(config.func_context);
 
-                    EBR_Node_Data* new_data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+                    Node_Data* new_data = (Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
                     new_data->thread_id.store(EMPTY_THREAD_ID, std::memory_order_relaxed);
                     if(slot->data.compare_exchange_strong(data, new_data) == false)
                         config.delete_node_func(user_data, config.func_context);
@@ -1274,7 +1354,7 @@ struct EBR {
                         config.publish_node_func(user_data, config.func_context);
 
                     data = slot->data.load();
-                    printf("TID %08llx helped allocate EBR_Node_Data 0x%p\n", (long long) thread_id, data);
+                    printf("TID %08llx helped allocate Node_Data 0x%p\n", (long long) thread_id, data);
                 }
                 ASSERT(data);
                 
@@ -1290,24 +1370,18 @@ struct EBR {
                         else
                             printf("TID %08llx replaced last thread %08llx last used %es ago in slot #%lli\n", (long long) thread_id, (long long) data->thread_id, ago*1e-9, (long long) i);
                             
+                        slot->id.store(thread_id, std::memory_order_relaxed);
+                        data->last_access_clock_ns.store(clock_ns(), std::memory_order_relaxed));
 
-                        data->last_access_clock_ns.store(clock_ns());
-                        data->thread_id.store(thread_id);
-                        slot->id.store(thread_id);
-
-                        //mark as full
-                        data->gen_and_taken.store(gen_and_taken + 2);
-                        
-                        void* user_data = (uint8_t*) data - config.node_ebr_offset;
-                        return user_data;
+                        return data;
                     }
                 }
             }
 
             //If we iterated all slots at least once, the instance hasnt changed and we still didnt find
-            // an empty slot, allocate a bigger instance. This new instance contains the same EBR_Node_Data
+            // an empty slot, allocate a bigger instance. This new instance contains the same Node_Data
             // as the old one (we jst copy pointers) but also has some new slots.
-            //All slots (even the ones that point to the old EBR_Node_Data) dont have their TIDs set, thus threads
+            //All slots (even the ones that point to the old Node_Data) dont have their TIDs set, thus threads
             // will fight again over the slots.
             //Note that ABA cannot happen since we never delete or abandon instances in use.
             if(instance == this->instance.load()) {
@@ -1325,17 +1399,36 @@ struct EBR {
         }
     }
 
-    void unlock(EBR_Config const& config, void* user_data) 
-    {
-        EBR_Node_Data* data = (EBR_Node_Data*) ((uint8_t*) user_data + config.node_ebr_offset);
+    void locking_end(Node_Data* data) {
+        //set to LOCKED state
+        uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
+        ASSERT(gen_and_taken % 4 == LOCKING);
+        data->gen_and_taken.store(gen_and_taken | LOCKED, std::memory_order_release);
+        
+        #ifdef EBR_TESTING
+        uint32_t tid = data->thread_id.load(std::memory_order_relaxed);
+        printf("TID %08llx locked in slot #%lli\n", (long long) tid);
+        #endif
+    }
 
+    void* lock(Config const& config, uint32_t thread_id, Node_Data** node_data)
+    {
+        void* user_data = locking_begin(config, thread_id, node_data);
+        locking_end(*node_data);
+        return user_data;
+    }
+
+    void unlock(Node_Data* data) 
+    {
+        #ifdef EBR_TESTING
         uint32_t tid = data->thread_id.load(std::memory_order_relaxed);
         printf("TID %08llx unlocked\n", (long long) tid);
-        
-        //clear the taken bit
+        #endif
+
+        //set to EMPTY state (and advance generation)
         uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
-        ASSERT(gen_and_taken % 4 == 2);
-        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_relaxed);
+        ASSERT(gen_and_taken % 4 == LOCKED);
+        data->gen_and_taken.store(gen_and_taken + 1, std::memory_order_relaxed);
     }
     
     Instance* make_instance(Instance* prev, uint64_t requested_capacity) 
@@ -1369,7 +1462,7 @@ struct EBR {
     void delete_instance(Instance* inst) {
         //if(delete_node_func != NULL)
         //    for(uint64_t i = inst->prev ? inst->prev->capacity : 0; i < inst->capacity; i++)  {
-        //        EBR_Node_Data* data = inst->slots[i].data.load(std::memory_order_relaxed);
+        //        Node_Data* data = inst->slots[i].data.load(std::memory_order_relaxed);
         //        void* user_data = (uint8_t*) data - node_ebr_offset;
         //        delete_node_func(user_data, func_context);
         //    }
@@ -1377,116 +1470,226 @@ struct EBR {
         free(inst);
     }
 
+    struct Locking {
+        EBR* ebr;
+        void* data;
+        Node_Data* node_data;
+
+        Locking(EBR& ebr, Config const& config, uint32_t thread_id) {
+            this->ebr = &ebr;
+            this->data = ebr.locking_begin(config, thread_id, &this->node_data);
+        }
+
+        //must be consumed
+        ~Locking() {
+            ASSERT(node_data == NULL);
+        }
+    };
+
     struct Lock {
         EBR* ebr;
         void* data;
-        const EBR_Config* config;
+        Node_Data* node_data;
 
-        Lock(EBR& ebr, EBR_Config const* config, uint32_t thread_id = current_thread_id()) {
+        Lock(Locking& prelock) {
+            ebr = prelock.ebr;
+            node_data = prelock.node_data;
+            data = prelock.data;
+
+            prelock.node_data = NULL;
+        }
+
+        Lock(EBR& ebr, Config const& config, uint32_t thread_id) {
             this->ebr = &ebr;
-            this->data = ebr.lock(*config, thread_id);
-            this->config = config;
+            this->data = ebr.lock(config, thread_id, &this->node_data);
+        }
+
+        template<typename Func>
+        Lock(EBR& ebr, Config const& config, uint32_t thread_id, Func const& func) {
+            this->ebr = &ebr;
+            this->data = locking_begin(config, thread_id, &this->node_data);
+            func(this->data);
+            locking_end(this->node_data);
         }
 
         ~Lock() {
-            ebr->unlock(*config, data);
+            ebr->unlock(node_data);
         }
     };
-    
-    
-    struct Private_Lock {
-        EBR* ebr;
-        EBR_Node_Data* data;
-        uint64_t gen_and_taken;
-
-        Private_Lock(EBR& ebr, EBR_Config const& config, uint32_t thread_id = current_thread_id()) {
-            this->ebr = &ebr;
-            this->data = ebr.lock(thread_id);
-        }
-
-        ~Private_Lock() {
-            ebr->unlock(data);
-        }
-    };
-
-    uint64_t private_lock(EBR_Node_Data* data, uint64_t clock_val = clock_ns(), uint32_t thread_id = current_thread_id()) {
-        uint64_t gen_and_taken = data->gen_and_taken.load(std::memory_order_relaxed);
-        data->gen_and_taken.store(gen_and_taken + 1, std::memory_order_relaxed);
-
-        data->last_access_clock_ns.store(clock_val, std::memory_order_relaxed);
-        data->thread_id.store(thread_id, std::memory_order_relaxed);
-
-        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_release);
-        return gen_and_taken + 2;
-    }
-
-    void private_unlock(EBR_Node_Data* data, uint64_t gen_and_taken) {
-        ASSERT(gen_and_taken % 4 == 2);
-        data->gen_and_taken.store(gen_and_taken + 2, std::memory_order_relaxed);
-    }
 };
-
-
-struct Collection {
-    struct Thread_Private;
-
-    EBR ebr;
-    Thread_Private* thread_data;
-    uint32_t ref_count;
-    
-    struct Node {
-        Node* next;
-        int data;
-    };
-    struct Thread_Private {
-        EBR::EBR_Node_Data ebr_data;
-        Collection* central;
-        Thread_Private* next;
-        Node* removed_nodes;
-        bool is_private;
-        bool is_deleted;
-    };
-    
-    void cleanup(Collection* central, Thread_Private* self) {
-        std::shared_ptr<int> p;
-    }
-    
-    static void* create_thread_private(void* context)
-    {
-        return new Thread_Private();
-    }
-    
-    static void delete_thread_private(void* node, void* context)
-    {
-        delete (Thread_Private*) node;
-    }
-    
-    static void publish_thread_private(void* node, void* context)
-    {
-        Thread_Private* tprivate = (Thread_Private*) node;
-        Collection* central = (Collection*) context;
-        tprivate->next = central->thread_data; 
-        central->thread_data = tprivate;
-    }
-};
-
 
 template <typename Key, typename Value, bool equals(Key const&, Key const&), uint64_t hash_func(Key const& key, uint64_t seed)>
 struct Atomic_Map2 {
 
     struct Node {
-        Gen_Ptr<Node*> next; 
+        Node* next; 
         uint64_t hash;
         Key key;
         Value value;
     };
 
-    Gen_Ptr<Node*>* buckets;
-    uint64_t capacity;
+    enum {GRAVEYARD_COUNT = 16};
+    struct alignas(std::hardware_destructive_interference_size) Graveyard {
+        std::atomic<Node*> node;
+    };
+
+    struct Instance {
+        Instance* next;
+        uint64_t capacity;
+        Graveyard graveyard[GRAVEYARD_COUNT];
+        Gen_Ptr<Node*> nodes[];
+    };
+
+    struct Thread_Private {
+        EBR::Node_Data node_data;
+        uint64_t hash;
+        Instance* instance;
+    };
+
     EBR ebr;
+    std::atomic<Instance*> curr_instance;
+    std::atomic<Instance*> old_instances; //treiber stack of old instances. Not sorted.
+
+    static EBR::Config ebr_config = {0};
+
+    uint64_t cleanup(Instance* my_instance) const
+    {
+        //Steal all deleted instances
+        Instance* first_instance = old_instances.exchange(NULL);
+        
+        //steal all deleted items
+        Node* graveyard[GRAVEYARD_COUNT] = {NULL};
+        for(int i = 0; i < GRAVEYARD_COUNT; i++)
+            graveyard[i] = my_instance->graveyard[i].node.exchange(NULL);
+            
+        struct Running_Info {
+            uint64_t hash;
+            Instance* instance;
+        };
+
+        Small_Array<Running_Info, 32> running = {};
+        ebr.gather_thread_state_table(ebr_config, &running, [](Running_Info* into, void* ptr, uint64_t gen){
+            (void) gen;
+            Thread_Private* private = (Thread_Private*) ptr;
+            into->hash = private.hash;
+            into->instance = private.instance;
+        });
+
+        //go through them and remove ones which are not used 
+        Instance* first_not_deleted = NULL;
+        Instance* last_not_deleted = NULL;
+        for(Instance* curr = first_instance; curr != NULL; ) {
+            Instance* next = curr->next;
+            bool referenced = false;
+            for(uint32_t i = 0; i < running.size; i++)
+                if(curr == running.data[i].instance) {
+                    referenced = true;
+                    break;
+                }
+
+            if(referenced) {
+                curr->next = first_not_deleted;
+                first_not_deleted = curr;
+                if(last_not_deleted == NULL)
+                    last_not_deleted = curr;
+                }
+            else {
+                free(curr); //TODO!
+            }
+
+            curr = next;
+        }
+
+        //insert the remaining back into the old_instances stack
+        if(first_not_deleted) {
+            for(;;) {
+                Instance* curr = old_instances.load();
+                last_not_deleted->next = curr;
+                if(old_instances.compare_exchange_weak(curr, first_not_deleted))
+                    break;
+            }
+        }
+
+        //remove the bad hashes
+        if(my_instance == curr_instance)
+        {
+            uint64_t mask = curr_instance->capacity - 1;
+            uint64_t offset = rand();
+
+            //filter out references to previous instances, deduplicate
+            Small_Array<uint64_t, 32> remove_hashes;
+            remove_hashes.reserve(running.size);
+            for(uint32_t it = 0; it < running.size; it++) {
+                uint64_t hash = running.data[it].hash & mask;
+                if(my_instance == running.data[it].instance) {
+                    bool push = true;
+                    for(uint32_t k = 0; k < remove_hashes.size; k++) 
+                        if(remove_hashes.data[k] == hash)
+                            push = false;
+                    
+                    if(push)
+                        remove_hashes.push(hash);
+                }
+            }
+
+            //go through all graves and delete not referenced.
+            //Make a new graveyard of the kept nodes
+            Node* new_graveyard_first[GRAVEYARD_COUNT] = {NULL};
+            Node* new_graveyard_last[GRAVEYARD_COUNT] = {NULL};
+
+            for(int g = 0; g < GRAVEYARD_COUNT; g++) {
+                Node* graves = graveyard[g];
+
+                for(Node* curr = graves; curr;) {
+                    Node* next = curr->next;
+
+                    bool is_referenced = false;
+                    for(uint32_t it = 0; it < remove_hashes.size; it++) {
+                        if((curr->hash & mask) == remove_hashes.data[it]) {
+                            is_referenced = true;
+                            break;
+                        }
+                    }
+
+                    if(is_referenced) {
+                        if(new_graveyard_last[g] == NULL)
+                            new_graveyard_last[g] = curr;
+
+                        curr->next = new_graveyard_first[g];
+                        new_graveyard_first[g] = curr;
+                    }
+                    else {
+                        delete curr;
+                    }
+
+                    curr = next;
+                }
+            }
+
+            //add kept graves to the current graveyard
+            for(int g = 0; g < GRAVEYARD_COUNT; g++) {
+                if(new_graveyard_first[g]) {
+                    for(;;) {
+                        std::atomic<Node*>* node_ptr = my_instance->graveyard[g];
+                        Node* curr = node_ptr->load();
+                        new_graveyard_last[g]->next = curr;
+                        if(node_ptr->compare_exchange_weak(curr, new_graveyard_first[g]))
+                            break;
+                    }
+                }
+            }
+        }
+    }
 
     bool get(Key const& key, uint64_t hash, Value* out) const {
-        EBR::Lock lock(ebr, hash, 0);
+        uint32_t thread_id = 0;
+        Instance* instance = NULL;
+        
+        EBR::Locking locking(ebr, config, thread_id);
+        Thread_Private* t_private = (Thread_Private*) locking.data;
+        t_private->hash = hash;
+        t_private->instance = instance;
+        EBR::Lock lock(locking);
 
         //TODO: repeat with instances...
 
@@ -1506,7 +1709,7 @@ struct Atomic_Map2 {
 
             //iterate all nodes in this bucket
             for(uint64_t iter = 0; ; iter++) {
-                typename Gen_Ptr<Node*>::Decompressed curr_d = curr.decode();
+                typename Gen_Ptr<Node*>::Value curr_d = curr.decode();
                 Node* node = curr_d.ptr;
                 if(node == NULL) 
                     break;
@@ -1524,6 +1727,9 @@ struct Atomic_Map2 {
             prev_bucket_gen = curr_gen;
         }
 
+        if(rand() % 256 == 0)
+            cleanup(instance);
+
         return false;
     }
     
@@ -1535,7 +1741,7 @@ struct Atomic_Map2 {
         uint64_t bucket_i = hash & (capacity - 1);
         Gen_Ptr<Node*>* bucket = &buckets[bucket_i];
         
-        typename Gen_Ptr<Node*>::Decompressed curr_bucket;
+        typename Gen_Ptr<Node*>::Value curr_bucket;
         while(false) {
             //NOTE: this is a ginat mess! better to unroll everything at this point!
             curr_bucket = bucket->decode();
